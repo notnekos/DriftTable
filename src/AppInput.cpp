@@ -40,6 +40,7 @@ enum : UINT {
     CMD_ICONS_SMALL,
     CMD_ALIGN_GRID,
     CMD_SHOW_ICONS,
+    CMD_EMPTY_HINT,
     CMD_SORT_NAME,
     CMD_SORT_SIZE,
     CMD_SORT_TYPE,
@@ -931,6 +932,7 @@ void App::showCanvasMenu(Vec2 p) {
     AppendMenuW(view, check(alignToGrid_), CMD_ALIGN_GRID, L"Выровнять значки по сетке");
     AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(view, check(showIcons_), CMD_SHOW_ICONS, L"Отображать значки рабочего стола");
+    AppendMenuW(view, check(emptyHint_), CMD_EMPTY_HINT, L"Подсказка «Здесь пусто»");
     for (UINT id : {CMD_ICONS_LARGE, CMD_ICONS_MEDIUM, CMD_ICONS_SMALL}) {
         MENUITEMINFOW mi{};
         mi.cbSize = sizeof(mi);
@@ -1080,6 +1082,7 @@ void App::runCommand(UINT cmd, Vec2 p) {
     case CMD_ICONS_SMALL: setIconSize(0); break;
     case CMD_ALIGN_GRID: setAlignToGrid(!alignToGrid_); break;
     case CMD_SHOW_ICONS: setShowIcons(!showIcons_); break;
+    case CMD_EMPTY_HINT: setEmptyHint(!emptyHint_); break;
     case CMD_SORT_NAME: arrangeFiles(SortKey::Name); break;
     case CMD_SORT_SIZE: arrangeFiles(SortKey::Size); break;
     case CMD_SORT_TYPE: arrangeFiles(SortKey::Type); break;

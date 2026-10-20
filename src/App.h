@@ -97,6 +97,7 @@ private:
     void setAlignToGrid(bool on);
     void arrangeFiles(SortKey key);
     void setShowIcons(bool on);
+    void setEmptyHint(bool on);
     int hitTest(Vec2 world) const; // like Board::hitTest, skipping hidden desktop icons
     std::wstring labelFor(const Item& it) const;
     DWORD dropEffect(const std::vector<std::wstring>& files, POINT screen, DWORD keys, DWORD allowed);
@@ -164,6 +165,7 @@ private:
     void drawNote(ID2D1RenderTarget* rt, const Item& it, bool selected);
     void drawStroke(ID2D1RenderTarget* rt, const Item& it, bool selected);
     void drawHud(ID2D1RenderTarget* rt);
+    float hudTextWidth(const wchar_t* text);
     void drawPill(ID2D1RenderTarget* rt, D2D1_RECT_F r, float alpha);
     IDWriteTextLayout* labelLayout(const Item& it, float width, int maxLines);
     IDWriteTextLayout* textLayout(const Item& it, const std::wstring& text, IDWriteTextFormat* fmt, float w,
@@ -200,6 +202,7 @@ private:
     int iconSize_ = 1; // 0 small, 1 medium, 2 large
     bool alignToGrid_ = true;
     bool showIcons_ = true;
+    bool emptyHint_ = true; // "nothing here, Home to go back" when the view is empty
     Vec2 newFileAnchor_;            // where files created from the desktop menu appear
     double newFileAnchorUntil_ = 0; // ... until this time (seconds())
     bool savePending_ = false;

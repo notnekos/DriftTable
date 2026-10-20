@@ -24,6 +24,7 @@ enum : UINT {
     TRAY_PEN,
     TRAY_HIDE_ICONS,
     TRAY_SYSTEM_ICONS,
+    TRAY_EMPTY_HINT,
     TRAY_AUTOSTART,
     TRAY_OPEN_DATA,
     TRAY_EXIT,
@@ -480,6 +481,7 @@ void App::loadSettings() {
     setTileSize(iconSize_);
     alignToGrid_ = GetPrivateProfileIntW(L"DriftTable", L"AlignToGrid", 1, settingsFile_.c_str()) != 0;
     showIcons_ = GetPrivateProfileIntW(L"DriftTable", L"ShowIcons", 1, settingsFile_.c_str()) != 0;
+    emptyHint_ = GetPrivateProfileIntW(L"DriftTable", L"EmptyHint", 1, settingsFile_.c_str()) != 0;
 }
 
 void App::saveSettings() {
@@ -496,6 +498,7 @@ void App::saveSettings() {
     WritePrivateProfileStringW(L"DriftTable", L"IconSize", std::to_wstring(iconSize_).c_str(), settingsFile_.c_str());
     WritePrivateProfileStringW(L"DriftTable", L"AlignToGrid", alignToGrid_ ? L"1" : L"0", settingsFile_.c_str());
     WritePrivateProfileStringW(L"DriftTable", L"ShowIcons", showIcons_ ? L"1" : L"0", settingsFile_.c_str());
+    WritePrivateProfileStringW(L"DriftTable", L"EmptyHint", emptyHint_ ? L"1" : L"0", settingsFile_.c_str());
 }
 
 bool App::autostartEnabled() const {
@@ -554,6 +557,7 @@ void App::showTrayMenu() {
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     if (mode_ != HostMode::Window)
         AppendMenuW(m, MF_STRING | (hideIcons_ ? MF_CHECKED : 0), TRAY_HIDE_ICONS, L"Скрывать значки Windows");
+    AppendMenuW(m, MF_STRING | (emptyHint_ ? MF_CHECKED : 0), TRAY_EMPTY_HINT, L"Подсказка «Здесь пусто»");
     AppendMenuW(m, MF_STRING, TRAY_SYSTEM_ICONS, L"Вернуть «Корзину» и «Этот компьютер»");
     AppendMenuW(m, MF_STRING | (autostartEnabled() ? MF_CHECKED : 0), TRAY_AUTOSTART,
                 L"Запускать вместе с Windows");
@@ -575,6 +579,7 @@ void App::showTrayMenu() {
     case TRAY_PEN: setTool(tool_ == Tool::Pen ? Tool::Select : Tool::Pen); break;
     case TRAY_HIDE_ICONS: setIconsHidden(!hideIcons_); break;
     case TRAY_SYSTEM_ICONS: addSystemIcons(); break;
+    case TRAY_EMPTY_HINT: setEmptyHint(!emptyHint_); break;
     case TRAY_AUTOSTART: setAutostart(!autostartEnabled()); break;
     case TRAY_OPEN_DATA: shell::open(main_, dataDir_); break;
     case TRAY_EXIT: quit(); break;

@@ -134,14 +134,15 @@ void App::renderSurface(size_t index) {
     drawHud(rt);
 
     // "Nothing here": help finding the way back after drifting away.
-    if (!anyVisible_ && !board_.items.empty() && !flight_.active) {
+    if (emptyHint_ && !anyVisible_ && !board_.items.empty() && !flight_.active) {
         RECT pa = primaryWorkArea();
         float d = (float)dpi_;
         float cx = (pa.left + pa.right) / 2.f / d, by = pa.bottom / d;
         rt->SetTransform(D2D1::Matrix3x2F::Scale(d, d) * surfaceBase_);
-        D2D1_RECT_F r = D2D1::RectF(cx - 150, by - 96, cx + 150, by - 62);
-        drawPill(rt, r, 0.8f);
         const wchar_t* text = L"Здесь пусто · Home — вернуться к началу";
+        float half = hudTextWidth(text) / 2 + 18;
+        D2D1_RECT_F r = D2D1::RectF(cx - half, by - 96, cx + half, by - 62);
+        drawPill(rt, r, 0.8f);
         rt->DrawText(text, (UINT32)wcslen(text), renderer_.hudFormat(), r,
                      renderer_.brush(D2D1::ColorF(1, 1, 1, 0.85f)));
     }
@@ -374,6 +375,15 @@ void App::drawStroke(ID2D1RenderTarget* rt, const Item& it, bool selected) {
     }
 }
 
+float App::hudTextWidth(const wchar_t* text) {
+    ComPtr<IDWriteTextLayout> layout;
+    DWRITE_TEXT_METRICS m{};
+    if (SUCCEEDED(renderer_.dwrite()->CreateTextLayout(text, (UINT32)wcslen(text), renderer_.hudFormat(), 4000.f,
+                                                       100.f, &layout)))
+        layout->GetMetrics(&m);
+    return m.width;
+}
+
 void App::drawPill(ID2D1RenderTarget* rt, D2D1_RECT_F r, float alpha) {
     float radius = (r.bottom - r.top) / 2;
     D2D1_ROUNDED_RECT rr{r, radius, radius};
@@ -446,7 +456,8 @@ void App::drawHud(ID2D1RenderTarget* rt) {
     if (overview_ && tool_ == Tool::Select) {
         const wchar_t* text = L"Обзор · щёлкните, куда перейти · Esc или Tab — назад";
         float cx = (pa.left + pa.right) / 2.f / d, y = pa.top / d + 14;
-        D2D1_RECT_F r = D2D1::RectF(cx - 210, y, cx + 210, y + 36);
+        float half = hudTextWidth(text) / 2 + 18;
+        D2D1_RECT_F r = D2D1::RectF(cx - half, y, cx + half, y + 36);
         drawPill(rt, r, 1.f);
         rt->DrawText(text, (UINT32)wcslen(text), renderer_.hudFormat(), r, white(0.92f));
     }

@@ -20,6 +20,9 @@ struct Image {
     std::vector<uint8_t> pixels;
     ComPtr<ID2D1Bitmap> bitmap;
     uint32_t generation = 0;
+    // Shell overlay drawn over a file icon (shortcut arrow, cloud status...),
+    // same size as the icon box with the mark in its corner. Null when none.
+    std::shared_ptr<Image> overlay;
 };
 
 struct LoadResult {

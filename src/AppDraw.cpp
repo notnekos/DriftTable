@@ -257,6 +257,12 @@ void App::drawFile(ID2D1RenderTarget* rt, const Item& it, bool selected, bool ho
         double dw = iw * f, dh = ih * f;
         D2D1_RECT_F dst = rectF(box.left + (tile().icon - dw) / 2, box.top + (tile().icon - dh), dw, dh);
         rt->DrawBitmap(bmp, dst, 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        // Shortcut arrow and other shell overlays: an icon-sized image with the
+        // mark in its corner, laid over the whole icon box like Explorer does.
+        if (img->overlay) {
+            if (ID2D1Bitmap* ov = renderer_.bitmapFor(*img->overlay))
+                rt->DrawBitmap(ov, box, 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        }
     } else {
         D2D1_ROUNDED_RECT ph{D2D1::RectF(box.left + 8, box.top + 8, box.right - 8, box.bottom - 8), 6, 6};
         rt->FillRoundedRectangle(ph, renderer_.brush(D2D1::ColorF(1, 1, 1, 0.18f)));

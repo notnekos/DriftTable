@@ -290,6 +290,12 @@ void App::arrangeFiles(SortKey key) {
     resetView();
 }
 
+void App::setEmptyHint(bool on) {
+    emptyHint_ = on;
+    saveSettings();
+    invalidate();
+}
+
 void App::setShowIcons(bool on) {
     showIcons_ = on;
     if (!on) {

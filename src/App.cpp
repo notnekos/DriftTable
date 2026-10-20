@@ -1,0 +1,562 @@
+#include "App.h"
+
+#include <dwmapi.h>
+#include <shlobj.h>
+
+namespace dt {
+
+namespace {
+
+constexpr wchar_t kMainClass[] = L"DriftTable.Main";
+constexpr wchar_t kCanvasClass[] = L"DriftTable.Canvas";
+constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+enum : UINT {
+    WM_APP_IMAGES = WM_APP + 1,
+    WM_APP_TRAY,
+    WM_APP_DROP,
+};
+
+enum : UINT {
+    TRAY_RESET = 1,
+    TRAY_FIT,
+    TRAY_PEN,
+    TRAY_HIDE_ICONS,
+    TRAY_SYSTEM_ICONS,
+    TRAY_AUTOSTART,
+    TRAY_OPEN_DATA,
+    TRAY_EXIT,
+};
+
+App* g_app = nullptr;
+HWND g_listView = nullptr; // for restoring desktop icons if we crash
+
+LONG WINAPI crashFilter(EXCEPTION_POINTERS*) {
+    if (g_listView) ShowWindow(g_listView, SW_SHOWNA);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+} // namespace
+
+int App::run(HINSTANCE instance, const Options& options) {
+    g_app = this;
+    instance_ = instance;
+
+    PWSTR appData = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, KF_FLAG_CREATE, nullptr, &appData)))
+        dataDir_ = std::wstring(appData) + L"\\DriftTable";
+    CoTaskMemFree(appData);
+    picturesDir_ = dataDir_ + L"\\pictures";
+    boardFile_ = dataDir_ + L"\\canvas.txt";
+    settingsFile_ = dataDir_ + L"\\settings.ini";
+    SHCreateDirectoryExW(nullptr, picturesDir_.c_str(), nullptr);
+
+    loadSettings();
+    if (options.modeForced) mode_ = options.mode;
+
+    if (!renderer_.init()) {
+        MessageBoxW(nullptr, L"Не удалось инициализировать Direct2D.", L"DriftTable", MB_ICONERROR);
+        return 1;
+    }
+    if (!registerClasses()) return 1;
+
+    taskbarCreated_ = RegisterWindowMessageW(L"TaskbarCreated");
+    main_ = CreateWindowExW(WS_EX_TOOLWINDOW, kMainClass, L"DriftTable", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr,
+                            instance_, nullptr);
+    if (!main_) return 1;
+
+    HDC screen = GetDC(nullptr);
+    dpi_ = GetDeviceCaps(screen, LOGPIXELSX) / 96.0;
+    ReleaseDC(nullptr, screen);
+
+    SetUnhandledExceptionFilter(crashFilter);
+    folders_.init();
+    loader_.start(main_, WM_APP_IMAGES);
+
+    if (mode_ != HostMode::Window) DesktopHost::spawnWorkerW();
+    if (!createCanvas(true)) {
+        MessageBoxW(nullptr, L"Не удалось создать окно холста.", L"DriftTable", MB_ICONERROR);
+        return 1;
+    }
+
+    loadBoard();
+    syncDesktop();
+    cleanupPictures();
+    addTrayIcon();
+    SetTimer(main_, TIMER_HOST, 2000, nullptr);
+
+    mainLoop();
+
+    saveNow();
+    saveSettings();
+    loader_.stop();
+    if (trayAdded_) Shell_NotifyIconW(NIM_DELETE, &tray_);
+    if (host_.listView) DesktopHost::setIconsVisible(host_, true);
+    return 0;
+}
+
+bool App::registerClasses() {
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = mainProc;
+    wc.hInstance = instance_;
+    wc.lpszClassName = kMainClass;
+    if (!RegisterClassExW(&wc)) return false;
+
+    WNDCLASSEXW cc{};
+    cc.cbSize = sizeof(cc);
+    cc.style = CS_DBLCLKS;
+    cc.lpfnWndProc = canvasProc;
+    cc.hInstance = instance_;
+    cc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    cc.hIcon = LoadIconW(instance_, MAKEINTRESOURCEW(1));
+    cc.lpszClassName = kCanvasClass;
+    return RegisterClassExW(&cc) != 0;
+}
+
+bool App::createCanvas(bool startup) {
+    if (mode_ == HostMode::Embed || mode_ == HostMode::Overlay) {
+        host_ = DesktopHost::find();
+        g_listView = host_.listView;
+        if (!host_.host) {
+            // No Explorer desktop (another shell, or Explorer is not running yet).
+            if (!startup) return false;
+            mode_ = HostMode::Window;
+        }
+    }
+
+    if (mode_ == HostMode::Embed) {
+        RECT rc;
+        GetClientRect(host_.host, &rc);
+        // A layered *child* window: needs Windows 8+ (declared in the manifest).
+        canvas_ = CreateWindowExW(WS_EX_LAYERED | WS_EX_NOPARENTNOTIFY, kCanvasClass, L"DriftTable",
+                                  WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0, rc.right, rc.bottom, host_.host,
+                                  nullptr, instance_, nullptr);
+        if (canvas_) {
+            SetWindowPos(canvas_, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        } else {
+            mode_ = HostMode::Overlay; // fall back
+        }
+    }
+    if (mode_ == HostMode::Overlay) {
+        int x = GetSystemMetrics(SM_XVIRTUALSCREEN), y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        int w = GetSystemMetrics(SM_CXVIRTUALSCREEN), h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        // Owned by the desktop: survives Win+D and never goes below the wallpaper.
+        canvas_ = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, kCanvasClass, L"DriftTable",
+                                  WS_POPUP, x, y, w, h, host_.host, nullptr, instance_, nullptr);
+        if (!canvas_) return false;
+        HWND above = GetWindow(host_.host, GW_HWNDPREV);
+        SetWindowPos(canvas_, above && above != canvas_ ? above : HWND_BOTTOM, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+    if (mode_ == HostMode::Window) {
+        canvas_ = CreateWindowExW(0, kCanvasClass, L"DriftTable — окно", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                                  CW_USEDEFAULT, CW_USEDEFAULT, 1280, 800, nullptr, nullptr, instance_, nullptr);
+        if (!canvas_) return false;
+    }
+
+    drop_ = new DropTarget(canvas_);
+    drop_->onOver = [this](const std::vector<std::wstring>& f, POINT pt, DWORD keys, DWORD allowed) {
+        return dropEffect(f, pt, keys, allowed);
+    };
+    drop_->onDrop = [this](const std::vector<std::wstring>& f, POINT pt, DWORD effect, DWORD keys) {
+        // Do the actual work after the OLE call returns, so the drag source is
+        // never blocked by our file operation dialogs.
+        drops_.push_back({f, pt, effect, keys});
+        PostMessageW(main_, WM_APP_DROP, 0, 0);
+    };
+    RegisterDragDrop(canvas_, drop_);
+
+    if (hideIcons_) DesktopHost::setIconsVisible(host_, false);
+    updateBounds();
+    return true;
+}
+
+void App::onCanvasDestroyed() {
+    if (drop_) {
+        drop_->Release();
+        drop_ = nullptr;
+    }
+    canvas_ = nullptr;
+    drag_ = Drag::None;
+}
+
+// Explorer can restart, and wallpaper engines can move the icon view into a new
+// WorkerW at any time. Re-attach whenever that happens.
+void App::checkHost() {
+    if (mode_ == HostMode::Window || quitting_) return;
+    DesktopHost h = DesktopHost::find();
+    if (!h.host) return;
+    if (!canvas_ || !IsWindow(canvas_)) {
+        canvas_ = nullptr;
+        createCanvas(false);
+        return;
+    }
+    bool changed = h.host != host_.host;
+    host_ = h;
+    g_listView = h.listView;
+    if (mode_ == HostMode::Embed) {
+        if (GetParent(canvas_) != h.host) SetParent(canvas_, h.host);
+        if (GetWindow(h.host, GW_CHILD) != canvas_)
+            SetWindowPos(canvas_, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    } else if (changed) {
+        SetWindowLongPtrW(canvas_, GWLP_HWNDPARENT, (LONG_PTR)h.host);
+    }
+    if (hideIcons_) DesktopHost::setIconsVisible(host_, false);
+
+    RECT rc{};
+    if (mode_ == HostMode::Embed) GetClientRect(h.host, &rc);
+    else rc = {0, 0, GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN)};
+    if (changed || rc.right != width_ || rc.bottom != height_) updateBounds();
+}
+
+void App::updateBounds() {
+    if (!canvas_) return;
+    int oldX = origin_.x, oldY = origin_.y;
+    if (mode_ == HostMode::Embed) {
+        RECT rc;
+        GetClientRect(host_.host, &rc);
+        width_ = rc.right;
+        height_ = rc.bottom;
+        SetWindowPos(canvas_, nullptr, 0, 0, width_, height_, SWP_NOZORDER | SWP_NOACTIVATE);
+        origin_ = {0, 0};
+        ClientToScreen(host_.host, &origin_);
+    } else if (mode_ == HostMode::Overlay) {
+        origin_ = {GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN)};
+        width_ = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        height_ = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        SetWindowPos(canvas_, nullptr, origin_.x, origin_.y, width_, height_, SWP_NOZORDER | SWP_NOACTIVATE);
+    } else {
+        RECT rc;
+        GetClientRect(canvas_, &rc);
+        width_ = rc.right;
+        height_ = rc.bottom;
+        origin_ = {0, 0};
+        ClientToScreen(canvas_, &origin_);
+    }
+    // Keep the content where it was on screen when the canvas origin moves.
+    if (mode_ != HostMode::Window) {
+        camX_ += (origin_.x - oldX) / scale();
+        camY_ += (origin_.y - oldY) / scale();
+    }
+    renderer_.resize(width_, height_);
+    invalidate();
+}
+
+RECT App::primaryWorkArea() const {
+    if (mode_ == HostMode::Window) return {0, 0, width_, height_};
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    GetMonitorInfoW(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY), &mi);
+    RECT r = mi.rcWork;
+    OffsetRect(&r, -origin_.x, -origin_.y);
+    return r;
+}
+
+void App::mainLoop() {
+    double last = seconds();
+    for (;;) {
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) return;
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        double now = seconds();
+        bool animating = tick(std::min(now - last, 0.05));
+        last = now;
+        if (dirty_ && canvas_) render();
+
+        const auto& handles = folders_.handles();
+        DWORD n = (DWORD)handles.size();
+        DWORD r;
+        if (animating) {
+            // Pace animation to the compositor; fall back to a short sleep.
+            double before = seconds();
+            if (FAILED(DwmFlush()) || seconds() - before < 0.002) Sleep(8);
+            r = n ? WaitForMultipleObjects(n, handles.data(), FALSE, 0) : WAIT_TIMEOUT;
+        } else {
+            r = MsgWaitForMultipleObjectsEx(n, handles.data(), INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            last = seconds();
+        }
+        if (r >= WAIT_OBJECT_0 && r < WAIT_OBJECT_0 + n) {
+            folders_.rearm(handles[r - WAIT_OBJECT_0]);
+            // Debounce: a copy of many files fires lots of notifications.
+            SetTimer(main_, TIMER_SYNC, 250, nullptr);
+        }
+    }
+}
+
+void App::quit() {
+    quitting_ = true;
+    commitEdit();
+    if (canvas_) {
+        RevokeDragDrop(canvas_);
+        DestroyWindow(canvas_);
+    }
+    PostQuitMessage(0);
+}
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+
+void App::loadSettings() {
+    wchar_t buf[64];
+    GetPrivateProfileStringW(L"DriftTable", L"Mode", L"embed", buf, 64, settingsFile_.c_str());
+    std::wstring m = toLower(buf);
+    savedMode_ = m == L"overlay" ? HostMode::Overlay : m == L"window" ? HostMode::Window : HostMode::Embed;
+    mode_ = savedMode_;
+    hideIcons_ = GetPrivateProfileIntW(L"DriftTable", L"HideDesktopIcons", 1, settingsFile_.c_str()) != 0;
+    GetPrivateProfileStringW(L"DriftTable", L"PenColor", L"FFFF4D4D", buf, 64, settingsFile_.c_str());
+    penColor_ = (uint32_t)wcstoul(buf, nullptr, 16) | 0xFF000000;
+    penWidthIndex_ = std::clamp((int)GetPrivateProfileIntW(L"DriftTable", L"PenWidth", 1, settingsFile_.c_str()), 0, 2);
+}
+
+void App::saveSettings() {
+    const wchar_t* m =
+        savedMode_ == HostMode::Overlay ? L"overlay" : savedMode_ == HostMode::Window ? L"window" : L"embed";
+    WritePrivateProfileStringW(L"DriftTable", L"Mode", m, settingsFile_.c_str());
+    WritePrivateProfileStringW(L"DriftTable", L"HideDesktopIcons", hideIcons_ ? L"1" : L"0", settingsFile_.c_str());
+    wchar_t buf[16];
+    swprintf(buf, 16, L"%08X", penColor_);
+    WritePrivateProfileStringW(L"DriftTable", L"PenColor", buf, settingsFile_.c_str());
+    WritePrivateProfileStringW(L"DriftTable", L"PenWidth", std::to_wstring(penWidthIndex_).c_str(),
+                               settingsFile_.c_str());
+}
+
+bool App::autostartEnabled() const {
+    wchar_t buf[MAX_PATH * 2];
+    DWORD size = sizeof(buf);
+    return RegGetValueW(HKEY_CURRENT_USER, kRunKey, L"DriftTable", RRF_RT_REG_SZ, nullptr, buf, &size) ==
+           ERROR_SUCCESS;
+}
+
+void App::setAutostart(bool on) {
+    HKEY key;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_SET_VALUE, &key) != ERROR_SUCCESS) return;
+    if (on) {
+        wchar_t exe[MAX_PATH];
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring cmd = L"\"" + std::wstring(exe) + L"\"";
+        RegSetValueExW(key, L"DriftTable", 0, REG_SZ, (const BYTE*)cmd.c_str(),
+                       (DWORD)((cmd.size() + 1) * sizeof(wchar_t)));
+    } else {
+        RegDeleteValueW(key, L"DriftTable");
+    }
+    RegCloseKey(key);
+}
+
+void App::setIconsHidden(bool hidden) {
+    hideIcons_ = hidden;
+    DesktopHost::setIconsVisible(host_, !hidden);
+    saveSettings();
+}
+
+// ---------------------------------------------------------------------------
+// Tray
+// ---------------------------------------------------------------------------
+
+void App::addTrayIcon() {
+    tray_ = {};
+    tray_.cbSize = sizeof(tray_);
+    tray_.hWnd = main_;
+    tray_.uID = 1;
+    tray_.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
+    tray_.uCallbackMessage = WM_APP_TRAY;
+    tray_.hIcon = LoadIconW(instance_, MAKEINTRESOURCEW(1));
+    if (!tray_.hIcon) tray_.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    wcscpy_s(tray_.szTip, L"DriftTable — бесконечный рабочий стол");
+    trayAdded_ = Shell_NotifyIconW(NIM_ADD, &tray_) != 0;
+    tray_.uVersion = NOTIFYICON_VERSION_4;
+    Shell_NotifyIconW(NIM_SETVERSION, &tray_);
+}
+
+void App::showTrayMenu() {
+    HMENU m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING, TRAY_RESET, L"Вернуться к началу\tHome");
+    AppendMenuW(m, MF_STRING, TRAY_FIT, L"Показать всё\tF");
+    AppendMenuW(m, MF_STRING | (tool_ == Tool::Pen ? MF_CHECKED : 0), TRAY_PEN, L"Рисовать\tB");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    if (mode_ != HostMode::Window)
+        AppendMenuW(m, MF_STRING | (hideIcons_ ? MF_CHECKED : 0), TRAY_HIDE_ICONS, L"Скрывать значки Windows");
+    AppendMenuW(m, MF_STRING, TRAY_SYSTEM_ICONS, L"Вернуть «Корзину» и «Этот компьютер»");
+    AppendMenuW(m, MF_STRING | (autostartEnabled() ? MF_CHECKED : 0), TRAY_AUTOSTART,
+                L"Запускать вместе с Windows");
+    AppendMenuW(m, MF_STRING, TRAY_OPEN_DATA, L"Открыть папку данных");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, TRAY_EXIT, L"Выход");
+
+    POINT pt;
+    GetCursorPos(&pt);
+    SetForegroundWindow(main_);
+    UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, main_, nullptr);
+    PostMessageW(main_, WM_NULL, 0, 0);
+    DestroyMenu(m);
+
+    switch (cmd) {
+    case TRAY_RESET: resetView(); break;
+    case TRAY_FIT: fitAll(); break;
+    case TRAY_PEN: setTool(tool_ == Tool::Pen ? Tool::Select : Tool::Pen); break;
+    case TRAY_HIDE_ICONS: setIconsHidden(!hideIcons_); break;
+    case TRAY_SYSTEM_ICONS: addSystemIcons(); break;
+    case TRAY_AUTOSTART: setAutostart(!autostartEnabled()); break;
+    case TRAY_OPEN_DATA: shell::open(main_, dataDir_); break;
+    case TRAY_EXIT: quit(); break;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Window procedures
+// ---------------------------------------------------------------------------
+
+LRESULT CALLBACK App::mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    return g_app ? g_app->onMainMessage(hwnd, msg, wp, lp) : DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+LRESULT CALLBACK App::canvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    return g_app ? g_app->onCanvasMessage(hwnd, msg, wp, lp) : DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+LRESULT App::onMainMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    LRESULT menuResult;
+    if (shell::handleMenuMessage(msg, wp, lp, &menuResult)) return menuResult;
+
+    if (msg == taskbarCreated_ && taskbarCreated_) {
+        // Explorer restarted: our canvas died together with the old desktop.
+        addTrayIcon();
+        checkHost();
+        return 0;
+    }
+    switch (msg) {
+    case WM_APP_IMAGES: onImagesLoaded(); return 0;
+    case WM_APP_DROP: processDrops(); return 0;
+    case WM_APP_TRAY:
+        switch (LOWORD(lp)) {
+        case WM_CONTEXTMENU:
+        case WM_RBUTTONUP: showTrayMenu(); break;
+        case WM_LBUTTONDBLCLK:
+        case NIN_SELECT: resetView(); break;
+        }
+        return 0;
+    case WM_TIMER:
+        switch (wp) {
+        case TIMER_SAVE:
+            KillTimer(hwnd, TIMER_SAVE);
+            saveNow();
+            break;
+        case TIMER_HOST: checkHost(); break;
+        case TIMER_SYNC:
+            KillTimer(hwnd, TIMER_SYNC);
+            syncDesktop();
+            break;
+        case TIMER_CARET:
+            caretOn_ = !caretOn_;
+            invalidate();
+            break;
+        }
+        return 0;
+    case WM_DISPLAYCHANGE:
+    case WM_SETTINGCHANGE:
+        updateBounds();
+        return 0;
+    case WM_QUERYENDSESSION: return TRUE;
+    case WM_ENDSESSION:
+        if (wp) {
+            saveNow();
+            if (host_.listView) DesktopHost::setIconsVisible(host_, true);
+        }
+        return 0;
+    case WM_CLOSE: quit(); return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+LRESULT App::onCanvasMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    LRESULT menuResult;
+    if (shell::handleMenuMessage(msg, wp, lp, &menuResult)) return menuResult;
+
+    auto pt = [lp] { return Vec2((short)LOWORD(lp), (short)HIWORD(lp)); };
+    switch (msg) {
+    case WM_LBUTTONDOWN: onMouseDown(0, pt(), false); return 0;
+    case WM_LBUTTONDBLCLK: onMouseDown(0, pt(), true); return 0;
+    case WM_MBUTTONDOWN:
+    case WM_MBUTTONDBLCLK: onMouseDown(1, pt(), false); return 0;
+    case WM_RBUTTONDOWN:
+    case WM_RBUTTONDBLCLK: onMouseDown(2, pt(), false); return 0;
+    case WM_LBUTTONUP: onMouseUp(0, pt()); return 0;
+    case WM_MBUTTONUP: onMouseUp(1, pt()); return 0;
+    case WM_RBUTTONUP: onMouseUp(2, pt()); return 0;
+    case WM_MOUSEMOVE:
+        if (!mouseTracked_) {
+            TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd, 0};
+            mouseTracked_ = TrackMouseEvent(&tme) != 0;
+        }
+        onMouseMove(pt());
+        return 0;
+    case WM_MOUSELEAVE:
+        mouseTracked_ = false;
+        if (hoverId_) {
+            hoverId_ = 0;
+            invalidate();
+        }
+        cursor_ = {-1000, -1000};
+        if (tool_ != Tool::Select) invalidate();
+        return 0;
+    case WM_MOUSEWHEEL:
+    case WM_MOUSEHWHEEL: {
+        POINT sp{(short)LOWORD(lp), (short)HIWORD(lp)};
+        onWheel(GET_WHEEL_DELTA_WPARAM(wp), msg == WM_MOUSEHWHEEL, screenToClient(sp));
+        return 0;
+    }
+    case WM_CAPTURECHANGED:
+        if ((HWND)lp != hwnd && drag_ != Drag::None) endDrag(true);
+        return 0;
+    case WM_KEYDOWN: onKeyDown(wp); return 0;
+    case WM_KEYUP: onKeyUp(wp); return 0;
+    case WM_CHAR: onChar((wchar_t)wp); return 0;
+    case WM_KILLFOCUS:
+        spaceDown_ = false;
+        return 0;
+    case WM_SETCURSOR:
+        if (LOWORD(lp) == HTCLIENT) {
+            POINT p;
+            GetCursorPos(&p);
+            SetCursor(cursorFor(screenToClient(p)));
+            return TRUE;
+        }
+        break;
+    case WM_MOUSEACTIVATE:
+        // The overlay window must not jump above other windows when clicked.
+        if (mode_ == HostMode::Overlay) return editId_ ? MA_ACTIVATE : MA_NOACTIVATE;
+        break;
+    case WM_WINDOWPOSCHANGING:
+        if (mode_ == HostMode::Overlay) reinterpret_cast<WINDOWPOS*>(lp)->flags |= SWP_NOZORDER;
+        break;
+    case WM_SIZE:
+        if (mode_ == HostMode::Window && canvas_) updateBounds();
+        return 0;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        BeginPaint(hwnd, &ps);
+        EndPaint(hwnd, &ps);
+        invalidate();
+        return 0;
+    }
+    case WM_ERASEBKGND: return 1;
+    case WM_CLOSE:
+        if (mode_ == HostMode::Window) quit();
+        return 0;
+    case WM_DESTROY:
+        RevokeDragDrop(hwnd);
+        if (hwnd == canvas_) onCanvasDestroyed();
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+POINT App::clientToScreen(Vec2 p) const { return {(LONG)p.x + origin_.x, (LONG)p.y + origin_.y}; }
+
+Vec2 App::screenToClient(POINT p) const { return {double(p.x - origin_.x), double(p.y - origin_.y)}; }
+
+} // namespace dt

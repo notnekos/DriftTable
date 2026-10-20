@@ -32,6 +32,22 @@ UINT contextMenu(HWND owner, const std::vector<std::wstring>& paths, POINT scree
 // Forwards owner-drawn menu messages to the active context menu (Send to, Open with...).
 bool handleMenuMessage(UINT msg, WPARAM wp, LPARAM lp, LRESULT* result);
 
+// The desktop background context menu (what Explorer shows on an empty spot of the
+// desktop: "New", "Display settings", and items added by apps such as NVIDIA
+// Control Panel, VS Code or Git), merged into one of our menus.
+class BackgroundMenu {
+public:
+    // Inserts the shell items at `position`. Returns false if there are none.
+    bool insert(HWND owner, HMENU menu, UINT position);
+    // Shows the menu. Returns our own command (>= kExtraMenuBase), or 0 when the
+    // shell handled the command or the menu was dismissed. *shellCommand tells
+    // which of the two happened.
+    UINT track(HWND owner, HMENU menu, POINT screenPt, const std::wstring& directory, bool* shellCommand);
+
+private:
+    ComPtr<IContextMenu> menu_;
+};
+
 enum class FileOp { Move, Copy };
 bool transfer(HWND owner, FileOp op, const std::vector<std::wstring>& sources, const std::wstring& destDir);
 bool recycle(HWND owner, const std::vector<std::wstring>& paths, bool silent = false);

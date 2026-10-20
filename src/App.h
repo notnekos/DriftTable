@@ -29,6 +29,7 @@ struct Options {
 };
 
 enum class Tool { Select, Pen, Eraser };
+enum class SortKey { Name, Size, Type, Date };
 
 enum : UINT_PTR {
     TIMER_SAVE = 1,
@@ -54,7 +55,16 @@ private:
     LRESULT onCanvasMessage(HWND, UINT, WPARAM, LPARAM);
     bool registerClasses();
     bool createCanvas(bool startup);
-    void onCanvasDestroyed();
+    void onCanvasDestroyed(HWND hwnd);
+    HWND createOverlayWindow(const RECT& r);
+    void addSurface(HWND hwnd);
+    struct Surface {
+        HWND hwnd;
+        RECT rect; // in canvas coordinates
+        DropTarget* drop;
+    };
+    const Surface* surfaceOf(HWND hwnd) const;
+    bool isOurWindow(HWND hwnd) const;
     void checkHost();
     void placeAtBottom();
     void focusCanvas();
@@ -80,6 +90,14 @@ private:
     void addSystemIcons();
     void onImagesLoaded();
     Image* imageFor(const Item& it);
+    int iconPixels() const;
+    std::wstring iconKey(const std::wstring& path) const;
+    void setIconSize(int size);
+    void snapToGrid(const std::vector<uint64_t>& ids);
+    void setAlignToGrid(bool on);
+    void arrangeFiles(SortKey key);
+    void setShowIcons(bool on);
+    int hitTest(Vec2 world) const; // like Board::hitTest, skipping hidden desktop icons
     std::wstring labelFor(const Item& it) const;
     DWORD dropEffect(const std::vector<std::wstring>& files, POINT screen, DWORD keys, DWORD allowed);
     void processDrops();
@@ -136,6 +154,8 @@ private:
 
     // ---- AppDraw.cpp ---------------------------------------------------
     void render();
+    void renderSurface(size_t index);
+    bool itemVisible(const Item& it) const { return showIcons_ || it.kind != ItemKind::File; }
     void drawBackground(ID2D1RenderTarget* rt);
     void drawGrid(ID2D1RenderTarget* rt);
     void drawItem(ID2D1RenderTarget* rt, const Item& it, bool selected, bool hovered);
@@ -155,7 +175,12 @@ private:
     HostMode savedMode_ = HostMode::Overlay; // from settings.ini; command line overrides don't stick
     bool allowZOrder_ = false;               // overlay: only we may change our z-order
     HWND main_ = nullptr;
-    HWND canvas_ = nullptr;
+    HWND canvas_ = nullptr;           // first surface: owner for dialogs, focus in embed/window mode
+    std::vector<Surface> surfaces_;   // one per monitor work area in overlay mode
+    HWND inputWnd_ = nullptr;         // surface that got the last mouse message (capture)
+    D2D1::Matrix3x2F surfaceBase_ = D2D1::Matrix3x2F::Identity(); // canvas -> current surface
+    RECT surfaceRect_{};
+    bool anyVisible_ = true;
     DesktopHost host_;
     bool hideIcons_ = true;
     bool quitting_ = false;
@@ -164,7 +189,6 @@ private:
     UINT taskbarCreated_ = 0;
     NOTIFYICONDATAW tray_{};
     bool trayAdded_ = false;
-    DropTarget* drop_ = nullptr;
 
     std::wstring dataDir_, boardFile_, settingsFile_, picturesDir_;
     Renderer renderer_;
@@ -172,6 +196,11 @@ private:
     DesktopFolders folders_;
     Board board_;
     bool firstRun_ = false;
+    int iconSize_ = 1; // 0 small, 1 medium, 2 large
+    bool alignToGrid_ = true;
+    bool showIcons_ = true;
+    Vec2 newFileAnchor_;            // where files created from the desktop menu appear
+    double newFileAnchorUntil_ = 0; // ... until this time (seconds())
     bool savePending_ = false;
     bool syncPending_ = false;
 

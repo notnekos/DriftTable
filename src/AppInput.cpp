@@ -35,6 +35,15 @@ enum : UINT {
     CMD_EXIT,
     CMD_PERSONALIZE,
     CMD_OVERVIEW,
+    CMD_ICONS_LARGE,
+    CMD_ICONS_MEDIUM,
+    CMD_ICONS_SMALL,
+    CMD_ALIGN_GRID,
+    CMD_SHOW_ICONS,
+    CMD_SORT_NAME,
+    CMD_SORT_SIZE,
+    CMD_SORT_TYPE,
+    CMD_SORT_DATE,
     CMD_DISPLAY,
     CMD_NOTE_COLOR, // + index
 };
@@ -232,6 +241,13 @@ void App::setTool(Tool t) {
     SetCursor(cursorFor(screenToClient(p)));
 }
 
+int App::hitTest(Vec2 w) const {
+    double tol = 4 / scale();
+    for (int i = (int)board_.items.size() - 1; i >= 0; --i)
+        if (itemVisible(board_.items[i]) && board_.hitItem(board_.items[i], w, tol)) return i;
+    return -1;
+}
+
 bool App::resizeHandleHit(Vec2 p, uint64_t* id) const {
     if (selected_.size() != 1 || tool_ != Tool::Select) return false;
     for (auto& it : board_.items) {
@@ -248,8 +264,7 @@ bool App::resizeHandleHit(Vec2 p, uint64_t* id) const {
 
 bool App::isOutsideCanvas(Vec2 p) const {
     HWND h = WindowFromPoint(clientToScreen(p));
-    if (!h) return false;
-    return GetAncestor(h, GA_ROOT) != GetAncestor(canvas_, GA_ROOT);
+    return h && !isOurWindow(h);
 }
 
 HCURSOR App::cursorFor(Vec2 p) const {
@@ -280,7 +295,7 @@ void App::onMouseDown(int button, Vec2 p, bool dbl) {
         panTravel_ = 0;
         panSamples_.clear();
         panSamples_.push_back({seconds(), p});
-        SetCapture(canvas_);
+        SetCapture(inputWnd_ ? inputWnd_ : canvas_);
         SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
     };
 
@@ -336,7 +351,7 @@ void App::onMouseDown(int button, Vec2 p, bool dbl) {
         s.pts.push_back({0, 0});
         drawingId_ = board_.add(std::move(s));
         drag_ = Drag::Draw;
-        SetCapture(canvas_);
+        SetCapture(inputWnd_ ? inputWnd_ : canvas_);
         invalidate();
         return;
     }
@@ -345,7 +360,7 @@ void App::onMouseDown(int button, Vec2 p, bool dbl) {
         erasedAny_ = false;
         drag_ = Drag::Erase;
         eraseAt(w);
-        SetCapture(canvas_);
+        SetCapture(inputWnd_ ? inputWnd_ : canvas_);
         return;
     }
 
@@ -355,11 +370,11 @@ void App::onMouseDown(int button, Vec2 p, bool dbl) {
         resizeId_ = rid;
         resizeOrig_ = it->rect();
         drag_ = Drag::Resize;
-        SetCapture(canvas_);
+        SetCapture(inputWnd_ ? inputWnd_ : canvas_);
         return;
     }
 
-    int idx = board_.hitTest(w, 4 / scale());
+    int idx = hitTest(w);
     bool ctrl = keyDown(VK_CONTROL) || keyDown(VK_SHIFT);
     if (idx >= 0) {
         uint64_t id = board_.items[idx].id;
@@ -383,7 +398,7 @@ void App::onMouseDown(int button, Vec2 p, bool dbl) {
         rubber_ = {};
         drag_ = Drag::Rubber;
     }
-    SetCapture(canvas_);
+    SetCapture(inputWnd_ ? inputWnd_ : canvas_);
     invalidate();
 }
 
@@ -427,7 +442,7 @@ void App::onMouseMove(Vec2 p) {
         rubber_ = RectD::fromPoints(toWorld(dragStart_), toWorld(p));
         if (!keyDown(VK_CONTROL) && !keyDown(VK_SHIFT)) selected_.clear();
         for (auto& it : board_.items)
-            if (rubber_.intersects(it.rect())) selected_.insert(it.id);
+            if (itemVisible(it) && rubber_.intersects(it.rect())) selected_.insert(it.id);
         invalidate();
         break;
     }
@@ -472,7 +487,7 @@ void App::onMouseMove(Vec2 p) {
     case Drag::None: {
         uint64_t hover = 0;
         if (tool_ == Tool::Select) {
-            int idx = board_.hitTest(toWorld(p), 4 / scale());
+            int idx = hitTest(toWorld(p));
             if (idx >= 0 && board_.items[idx].kind != ItemKind::Stroke) hover = board_.items[idx].id;
         }
         if (hover != hoverId_) {
@@ -493,7 +508,7 @@ void App::onMouseUp(int button, Vec2 p) {
             return;
         }
         commitEdit();
-        int idx = board_.hitTest(toWorld(p), 4 / scale());
+        int idx = hitTest(toWorld(p));
         if (idx >= 0) showItemMenu(idx, p);
         else showCanvasMenu(p);
         return;
@@ -505,7 +520,7 @@ void App::onMouseUp(int button, Vec2 p) {
 void App::endDrag(bool cancelled) {
     Drag d = drag_;
     drag_ = Drag::None; // before ReleaseCapture: it sends WM_CAPTURECHANGED
-    if (GetCapture() == canvas_) ReleaseCapture();
+    if (isOurWindow(GetCapture())) ReleaseCapture();
 
     switch (d) {
     case Drag::Pan: {
@@ -526,6 +541,11 @@ void App::endDrag(bool cancelled) {
         break;
     }
     case Drag::Move:
+        if (dragMoved_ && alignToGrid_) {
+            std::vector<uint64_t> ids;
+            for (auto& [id, origin] : moveOrigins_) ids.push_back(id);
+            snapToGrid(ids);
+        }
         if (!dragMoved_) {
             if (!cancelled && !keyDown(VK_CONTROL) && !keyDown(VK_SHIFT)) selectOnly(pressedId_);
             if (!cancelled && overview_) {
@@ -583,7 +603,7 @@ void App::startDragOut() {
     if (dragMoved_) board_.discardUndo();
     dragMoved_ = false;
     drag_ = Drag::None;
-    if (GetCapture() == canvas_) ReleaseCapture();
+    if (isOurWindow(GetCapture())) ReleaseCapture();
     invalidate();
     render();
     shell::dragOut(paths);
@@ -614,7 +634,7 @@ void App::onDoubleClick(Vec2 p) {
     }
     if (tool_ != Tool::Select) return;
     Vec2 w = toWorld(p);
-    int idx = board_.hitTest(w, 4 / scale());
+    int idx = hitTest(w);
     if (idx < 0) {
         board_.pushUndo();
         uint64_t id = addNote({w.x - 20, w.y - 20}, L"");
@@ -750,7 +770,8 @@ void App::onKeyDown(WPARAM vk) {
         break;
     case 'A':
         if (ctrl)
-            for (auto& it : board_.items) selected_.insert(it.id);
+            for (auto& it : board_.items)
+                if (itemVisible(it)) selected_.insert(it.id);
         break;
     case 'C':
         if (ctrl) shell::copyToClipboard(canvas_, selectedFilePaths());
@@ -894,35 +915,79 @@ void App::showItemMenu(int index, Vec2 p) {
     if (cmd) runCommand(cmd, p);
 }
 
+// Laid out like the Windows desktop menu: View, Sort by, Refresh, Paste, Undo,
+// then everything the shell and installed apps put there, then our own tools.
 void App::showCanvasMenu(Vec2 p) {
     UINT png = RegisterClipboardFormatW(L"PNG");
     bool canPaste = IsClipboardFormatAvailable(CF_HDROP) || IsClipboardFormatAvailable(CF_DIB) ||
                     IsClipboardFormatAvailable(png) || IsClipboardFormatAvailable(CF_UNICODETEXT);
-    auto check = [this](Tool t) { return MF_STRING | (tool_ == t ? MF_CHECKED : 0); };
+    auto check = [](bool on) { return MF_STRING | (on ? MF_CHECKED : 0); };
+
+    HMENU view = CreatePopupMenu();
+    AppendMenuW(view, check(iconSize_ == 2), CMD_ICONS_LARGE, L"Крупные значки");
+    AppendMenuW(view, check(iconSize_ == 1), CMD_ICONS_MEDIUM, L"Обычные значки");
+    AppendMenuW(view, check(iconSize_ == 0), CMD_ICONS_SMALL, L"Мелкие значки");
+    AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(view, check(alignToGrid_), CMD_ALIGN_GRID, L"Выровнять значки по сетке");
+    AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(view, check(showIcons_), CMD_SHOW_ICONS, L"Отображать значки рабочего стола");
+    for (UINT id : {CMD_ICONS_LARGE, CMD_ICONS_MEDIUM, CMD_ICONS_SMALL}) {
+        MENUITEMINFOW mi{};
+        mi.cbSize = sizeof(mi);
+        mi.fMask = MIIM_FTYPE;
+        mi.fType = MFT_RADIOCHECK;
+        SetMenuItemInfoW(view, id, FALSE, &mi);
+    }
+
+    HMENU sort = CreatePopupMenu();
+    AppendMenuW(sort, MF_STRING, CMD_SORT_NAME, L"Имя");
+    AppendMenuW(sort, MF_STRING, CMD_SORT_SIZE, L"Размер");
+    AppendMenuW(sort, MF_STRING, CMD_SORT_TYPE, L"Тип элемента");
+    AppendMenuW(sort, MF_STRING, CMD_SORT_DATE, L"Дата изменения");
 
     HMENU m = CreatePopupMenu();
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)view, L"Вид");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)sort, L"Сортировка");
+    AppendMenuW(m, MF_STRING, CMD_REFRESH, L"Обновить\tF5");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (canPaste ? 0 : MF_GRAYED), CMD_PASTE, L"Вставить\tCtrl+V");
+    AppendMenuW(m, MF_STRING | (board_.canUndo() ? 0 : MF_GRAYED), CMD_UNDO, L"Отменить\tCtrl+Z");
     AppendMenuW(m, MF_STRING, CMD_NEW_NOTE, L"Новая заметка\tN");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, check(Tool::Select), CMD_TOOL_SELECT, L"Выделение\tV");
-    AppendMenuW(m, check(Tool::Pen), CMD_TOOL_PEN, L"Перо\tB");
-    AppendMenuW(m, check(Tool::Eraser), CMD_TOOL_ERASER, L"Ластик\tE");
+
+    // Shell and third-party items (New, Display settings, NVIDIA, VS Code, Git...).
+    shell::BackgroundMenu shellMenu;
+    HWND owner = menuOwner();
+    if (!shellMenu.insert(owner, m, GetMenuItemCount(m))) {
+        AppendMenuW(m, MF_STRING, CMD_DISPLAY, L"Параметры экрана");
+        AppendMenuW(m, MF_STRING, CMD_PERSONALIZE, L"Персонализация");
+    }
+
+    HMENU drift = CreatePopupMenu();
+    AppendMenuW(drift, MF_STRING, CMD_HOME, L"Вернуться к началу\tHome");
+    AppendMenuW(drift, MF_STRING, CMD_FIT, L"Показать всё\tF");
+    AppendMenuW(drift, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(drift, check(tool_ == Tool::Select), CMD_TOOL_SELECT, L"Выделение\tV");
+    AppendMenuW(drift, check(tool_ == Tool::Eraser), CMD_TOOL_ERASER, L"Ластик\tE");
+    AppendMenuW(drift, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(drift, MF_STRING, CMD_OPEN_DESKTOP, L"Открыть папку «Рабочий стол»");
+    AppendMenuW(drift, MF_STRING, CMD_EXIT, L"Выйти из DriftTable");
+
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, CMD_HOME, L"Вернуться к началу\tHome");
-    AppendMenuW(m, MF_STRING | (overview_ ? MF_CHECKED : 0), CMD_OVERVIEW, L"Обзор (отдалить)\tTab");
-    AppendMenuW(m, MF_STRING, CMD_FIT, L"Показать всё\tF");
-    AppendMenuW(m, MF_STRING | (board_.canUndo() ? 0 : MF_GRAYED), CMD_UNDO, L"Отменить\tCtrl+Z");
-    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, CMD_OPEN_DESKTOP, L"Открыть папку «Рабочий стол»");
-    AppendMenuW(m, MF_STRING, CMD_REFRESH, L"Обновить\tF5");
-    AppendMenuW(m, MF_STRING, CMD_DISPLAY, L"Параметры экрана");
-    AppendMenuW(m, MF_STRING, CMD_PERSONALIZE, L"Персонализация");
-    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, CMD_EXIT, L"Выйти из DriftTable");
+    AppendMenuW(m, check(overview_), CMD_OVERVIEW, L"Обзор (отдалить)\tTab");
+    AppendMenuW(m, check(tool_ == Tool::Pen), CMD_TOOL_PEN, L"Рисовать\tB");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)drift, L"DriftTable");
 
     POINT sp = clientToScreen(p);
-    UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, sp.x, sp.y, menuOwner(), nullptr);
+    bool shellCommand = false;
+    UINT cmd = shellMenu.track(owner, m, sp, folders_.userDesktop(), &shellCommand);
     DestroyMenu(m);
+    if (shellCommand) {
+        // e.g. New > Text Document: the file should appear where the menu was opened.
+        newFileAnchor_ = toWorld(p);
+        newFileAnchorUntil_ = seconds() + 20;
+        SetTimer(main_, TIMER_SYNC, 300, nullptr);
+    }
     if (cmd) runCommand(cmd, p);
 }
 
@@ -1010,6 +1075,15 @@ void App::runCommand(UINT cmd, Vec2 p) {
     case CMD_HOME: resetView(); break;
     case CMD_FIT: fitAll(); break;
     case CMD_OVERVIEW: toggleOverview(); break;
+    case CMD_ICONS_LARGE: setIconSize(2); break;
+    case CMD_ICONS_MEDIUM: setIconSize(1); break;
+    case CMD_ICONS_SMALL: setIconSize(0); break;
+    case CMD_ALIGN_GRID: setAlignToGrid(!alignToGrid_); break;
+    case CMD_SHOW_ICONS: setShowIcons(!showIcons_); break;
+    case CMD_SORT_NAME: arrangeFiles(SortKey::Name); break;
+    case CMD_SORT_SIZE: arrangeFiles(SortKey::Size); break;
+    case CMD_SORT_TYPE: arrangeFiles(SortKey::Type); break;
+    case CMD_SORT_DATE: arrangeFiles(SortKey::Date); break;
     case CMD_UNDO:
         if (board_.undo()) {
             syncDesktop();

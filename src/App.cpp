@@ -130,6 +130,31 @@ bool App::registerClasses() {
     return RegisterClassExW(&cc) != 0;
 }
 
+namespace {
+
+// One overlay window per monitor work area: it never overlaps a taskbar and never
+// covers a whole monitor, which Windows would treat as a full-screen app (and then
+// drop the taskbar behind it).
+std::vector<RECT> workAreas() {
+    std::vector<RECT> out;
+    EnumDisplayMonitors(
+        nullptr, nullptr,
+        [](HMONITOR m, HDC, LPRECT, LPARAM lp) -> BOOL {
+            MONITORINFO mi{};
+            mi.cbSize = sizeof(mi);
+            if (GetMonitorInfoW(m, &mi)) {
+                RECT r = mi.rcWork;
+                if (EqualRect(&r, &mi.rcMonitor)) r.bottom -= 1; // auto-hidden taskbar
+                reinterpret_cast<std::vector<RECT>*>(lp)->push_back(r);
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&out));
+    return out;
+}
+
+} // namespace
+
 bool App::createCanvas(bool startup) {
     if (mode_ == HostMode::Embed || mode_ == HostMode::Overlay) {
         host_ = DesktopHost::find();
@@ -153,88 +178,119 @@ bool App::createCanvas(bool startup) {
         RECT rc;
         GetClientRect(host_.host, &rc);
         // A layered *child* window: needs Windows 8+ (declared in the manifest).
-        canvas_ = CreateWindowExW(WS_EX_LAYERED | WS_EX_NOPARENTNOTIFY, kCanvasClass, L"DriftTable",
-                                  WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0, rc.right, rc.bottom, host_.host,
-                                  nullptr, instance_, nullptr);
-        if (canvas_) {
-            SetWindowPos(canvas_, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        HWND hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_NOPARENTNOTIFY, kCanvasClass, L"DriftTable",
+                                    WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0, rc.right, rc.bottom, host_.host,
+                                    nullptr, instance_, nullptr);
+        if (hwnd) {
+            SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            addSurface(hwnd);
         } else {
             mode_ = HostMode::Overlay; // fall back
         }
     }
-    if (mode_ == HostMode::Overlay) {
-        int x = GetSystemMetrics(SM_XVIRTUALSCREEN), y = GetSystemMetrics(SM_YVIRTUALSCREEN);
-        int w = GetSystemMetrics(SM_CXVIRTUALSCREEN), h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-        // Owned by the desktop: survives Win+D and never goes below the wallpaper.
-        canvas_ = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, kCanvasClass, L"DriftTable",
-                                  WS_POPUP, x, y, w, h, host_.host, nullptr, instance_, nullptr);
-        if (canvas_) {
-            placeAtBottom();
-        } else if (startup) {
-            mode_ = HostMode::Window;
-        } else {
-            return false;
-        }
-    }
     if (mode_ == HostMode::Window) {
-        canvas_ = CreateWindowExW(0, kCanvasClass, L"DriftTable — окно", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                                  CW_USEDEFAULT, CW_USEDEFAULT, 1280, 800, nullptr, nullptr, instance_, nullptr);
-        if (!canvas_) return false;
+        HWND hwnd = CreateWindowExW(0, kCanvasClass, L"DriftTable — окно", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                                    CW_USEDEFAULT, CW_USEDEFAULT, 1280, 800, nullptr, nullptr, instance_, nullptr);
+        if (!hwnd) return false;
+        addSurface(hwnd);
     }
+    updateBounds(); // creates the overlay windows, one per monitor
 
-    logf(L"canvas=%p", (void*)canvas_);
-    drop_ = new DropTarget(canvas_);
-    drop_->onOver = [this](const std::vector<std::wstring>& f, POINT pt, DWORD keys, DWORD allowed) {
+    if (surfaces_.empty()) {
+        if (!startup || mode_ != HostMode::Overlay) return false;
+        mode_ = HostMode::Window;
+        return createCanvas(startup);
+    }
+    if (hideIcons_) DesktopHost::setIconsVisible(host_, false);
+    return true;
+}
+
+HWND App::createOverlayWindow(const RECT& r) {
+    // Owned by the desktop: survives Win+D and never goes below the wallpaper.
+    HWND hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, kCanvasClass, L"DriftTable",
+                                WS_POPUP, r.left, r.top, r.right - r.left, r.bottom - r.top, host_.host, nullptr,
+                                instance_, nullptr);
+    if (hwnd) addSurface(hwnd);
+    return hwnd;
+}
+
+void App::addSurface(HWND hwnd) {
+    Surface s{hwnd, {}, new DropTarget(hwnd)};
+    s.drop->onOver = [this](const std::vector<std::wstring>& f, POINT pt, DWORD keys, DWORD allowed) {
         return dropEffect(f, pt, keys, allowed);
     };
-    drop_->onDrop = [this](const std::vector<std::wstring>& f, POINT pt, DWORD effect, DWORD keys) {
+    s.drop->onDrop = [this](const std::vector<std::wstring>& f, POINT pt, DWORD effect, DWORD keys) {
         // Do the actual work after the OLE call returns, so the drag source is
         // never blocked by our file operation dialogs.
         drops_.push_back({f, pt, effect, keys});
         PostMessageW(main_, WM_APP_DROP, 0, 0);
     };
-    RegisterDragDrop(canvas_, drop_);
+    RegisterDragDrop(hwnd, s.drop);
+    surfaces_.push_back(s);
+    canvas_ = surfaces_[0].hwnd;
+    logf(L"canvas window %p", (void*)hwnd);
+}
 
-    if (hideIcons_) DesktopHost::setIconsVisible(host_, false);
-    updateBounds();
-    return true;
+const App::Surface* App::surfaceOf(HWND hwnd) const {
+    for (auto& s : surfaces_)
+        if (s.hwnd == hwnd) return &s;
+    return nullptr;
+}
+
+bool App::isOurWindow(HWND hwnd) const {
+    if (!hwnd) return false;
+    HWND root = GetAncestor(hwnd, GA_ROOT);
+    if (root == main_) return true;
+    for (auto& s : surfaces_)
+        if (s.hwnd == hwnd || GetAncestor(s.hwnd, GA_ROOT) == root) return true;
+    return false;
 }
 
 // Overlay: directly above the desktop window, i.e. below every normal window.
 void App::placeAtBottom() {
-    if (mode_ != HostMode::Overlay || !canvas_) return;
-    HWND after = HWND_BOTTOM;
-    if (host_.host) {
-        HWND above = GetWindow(host_.host, GW_HWNDPREV);
-        if (above == canvas_) {
-            ShowWindow(canvas_, SW_SHOWNA);
-            return;
+    if (mode_ != HostMode::Overlay) return;
+    for (auto& s : surfaces_) {
+        HWND after = HWND_BOTTOM;
+        if (host_.host) {
+            HWND above = GetWindow(host_.host, GW_HWNDPREV);
+            while (above && surfaceOf(above)) above = GetWindow(above, GW_HWNDPREV);
+            if (above == nullptr) after = HWND_TOP;
+            // Inserting under a topmost window would make us topmost (above the taskbar).
+            else after = (GetWindowLongW(above, GWL_EXSTYLE) & WS_EX_TOPMOST) ? HWND_NOTOPMOST : above;
         }
-        if (above) after = above;
+        allowZOrder_ = true;
+        SetWindowPos(s.hwnd, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        if (GetWindowLongW(s.hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST)
+            SetWindowPos(s.hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        allowZOrder_ = false;
     }
-    allowZOrder_ = true;
-    SetWindowPos(canvas_, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    allowZOrder_ = false;
 }
 
 void App::focusCanvas() {
     if (mode_ == HostMode::Overlay) {
         if (GetForegroundWindow() != main_) SetForegroundWindow(main_);
         if (GetFocus() != main_) SetFocus(main_);
-    } else if (GetFocus() != canvas_) {
+    } else if (canvas_ && GetFocus() != canvas_) {
         SetFocus(canvas_);
     }
 }
 
 HWND App::menuOwner() const { return mode_ == HostMode::Overlay ? main_ : canvas_; }
 
-void App::onCanvasDestroyed() {
-    if (drop_) {
-        drop_->Release();
-        drop_ = nullptr;
+void App::onCanvasDestroyed(HWND hwnd) {
+    for (size_t i = 0; i < surfaces_.size(); ++i) {
+        if (surfaces_[i].hwnd != hwnd) continue;
+        surfaces_[i].drop->Release();
+        surfaces_.erase(surfaces_.begin() + i);
+        break;
     }
-    canvas_ = nullptr;
-    drag_ = Drag::None;
+    canvas_ = surfaces_.empty() ? nullptr : surfaces_[0].hwnd;
+    if (drag_ != Drag::None) drag_ = Drag::None;
+    renderer_.setSurfaceCount(surfaces_.size());
+    for (size_t i = 0; i < surfaces_.size(); ++i)
+        renderer_.resize(i, surfaces_[i].rect.right - surfaces_[i].rect.left,
+                         surfaces_[i].rect.bottom - surfaces_[i].rect.top);
+    invalidate();
 }
 
 // Explorer can restart, and wallpaper engines can move the icon view into a new
@@ -243,8 +299,15 @@ void App::checkHost() {
     if (mode_ == HostMode::Window || quitting_) return;
     DesktopHost h = DesktopHost::find();
     if (!h.host) return;
-    if (!canvas_ || !IsWindow(canvas_)) {
-        canvas_ = nullptr;
+    bool dead = surfaces_.empty();
+    for (auto& s : surfaces_) dead |= !IsWindow(s.hwnd);
+    if (dead) {
+        // The windows died together with the old desktop (owned / child windows).
+        while (!surfaces_.empty()) {
+            HWND hwnd = surfaces_.back().hwnd;
+            if (IsWindow(hwnd)) DestroyWindow(hwnd);
+            else onCanvasDestroyed(hwnd);
+        }
         createCanvas(false);
         return;
     }
@@ -256,47 +319,81 @@ void App::checkHost() {
         if (GetWindow(h.host, GW_CHILD) != canvas_)
             SetWindowPos(canvas_, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     } else if (changed) {
-        SetWindowLongPtrW(canvas_, GWLP_HWNDPARENT, (LONG_PTR)h.host);
+        for (auto& s : surfaces_) SetWindowLongPtrW(s.hwnd, GWLP_HWNDPARENT, (LONG_PTR)h.host);
         placeAtBottom();
     }
     if (hideIcons_) DesktopHost::setIconsVisible(host_, false);
-
-    RECT rc{};
-    if (mode_ == HostMode::Embed) GetClientRect(h.host, &rc);
-    else rc = {0, 0, GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN)};
-    if (changed || rc.right != width_ || rc.bottom != height_) updateBounds();
+    updateBounds(); // cheap when nothing moved
 }
 
 void App::updateBounds() {
-    if (!canvas_) return;
     int oldX = origin_.x, oldY = origin_.y;
+    bool changed = false;
+    auto setRect = [&](Surface& s, RECT r) {
+        if (!EqualRect(&s.rect, &r)) changed = true;
+        s.rect = r;
+    };
     if (mode_ == HostMode::Embed) {
+        if (surfaces_.empty()) return;
         RECT rc;
         GetClientRect(host_.host, &rc);
         width_ = rc.right;
         height_ = rc.bottom;
-        SetWindowPos(canvas_, nullptr, 0, 0, width_, height_, SWP_NOZORDER | SWP_NOACTIVATE);
         origin_ = {0, 0};
         ClientToScreen(host_.host, &origin_);
+        if (!EqualRect(&surfaces_[0].rect, &rc))
+            SetWindowPos(canvas_, nullptr, 0, 0, width_, height_, SWP_NOZORDER | SWP_NOACTIVATE);
+        setRect(surfaces_[0], rc);
     } else if (mode_ == HostMode::Overlay) {
         origin_ = {GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN)};
         width_ = GetSystemMetrics(SM_CXVIRTUALSCREEN);
         height_ = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-        SetWindowPos(canvas_, nullptr, origin_.x, origin_.y, width_, height_, SWP_NOZORDER | SWP_NOACTIVATE);
+        std::vector<RECT> areas = workAreas();
+        while (surfaces_.size() > areas.size()) {
+            HWND hwnd = surfaces_.back().hwnd;
+            onCanvasDestroyed(hwnd);
+            DestroyWindow(hwnd);
+            changed = true;
+        }
+        bool added = false;
+        while (surfaces_.size() < areas.size()) {
+            if (!createOverlayWindow(areas[surfaces_.size()])) break;
+            added = changed = true;
+        }
+        for (size_t i = 0; i < surfaces_.size(); ++i) {
+            RECT a = areas[i];
+            RECT local = a;
+            OffsetRect(&local, -origin_.x, -origin_.y);
+            if (!EqualRect(&surfaces_[i].rect, &local))
+                SetWindowPos(surfaces_[i].hwnd, nullptr, a.left, a.top, a.right - a.left, a.bottom - a.top,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+            setRect(surfaces_[i], local);
+        }
+        if (added) placeAtBottom();
     } else {
+        if (surfaces_.empty()) return;
         RECT rc;
         GetClientRect(canvas_, &rc);
         width_ = rc.right;
         height_ = rc.bottom;
         origin_ = {0, 0};
         ClientToScreen(canvas_, &origin_);
+        setRect(surfaces_[0], rc);
     }
+    if (!changed && origin_.x == oldX && origin_.y == oldY) return;
+
     // Keep the content where it was on screen when the canvas origin moves.
     if (mode_ != HostMode::Window) {
         camX_ += (origin_.x - oldX) / scale();
         camY_ += (origin_.y - oldY) / scale();
     }
-    renderer_.resize(width_, height_);
+    renderer_.setSurfaceCount(surfaces_.size());
+    for (size_t i = 0; i < surfaces_.size(); ++i) {
+        const RECT& r = surfaces_[i].rect;
+        renderer_.resize(i, r.right - r.left, r.bottom - r.top);
+        logf(L"surface %u: %d,%d %dx%d", (unsigned)i, r.left + origin_.x, r.top + origin_.y, r.right - r.left,
+             r.bottom - r.top);
+    }
     invalidate();
 }
 
@@ -347,9 +444,9 @@ void App::mainLoop() {
 void App::quit() {
     quitting_ = true;
     commitEdit();
-    if (canvas_) {
-        RevokeDragDrop(canvas_);
-        DestroyWindow(canvas_);
+    while (!surfaces_.empty()) {
+        HWND hwnd = surfaces_.back().hwnd;
+        if (!IsWindow(hwnd) || !DestroyWindow(hwnd)) onCanvasDestroyed(hwnd);
     }
     PostQuitMessage(0);
 }
@@ -368,6 +465,10 @@ void App::loadSettings() {
     GetPrivateProfileStringW(L"DriftTable", L"PenColor", L"FFFF4D4D", buf, 64, settingsFile_.c_str());
     penColor_ = (uint32_t)wcstoul(buf, nullptr, 16) | 0xFF000000;
     penWidthIndex_ = std::clamp((int)GetPrivateProfileIntW(L"DriftTable", L"PenWidth", 1, settingsFile_.c_str()), 0, 2);
+    iconSize_ = std::clamp((int)GetPrivateProfileIntW(L"DriftTable", L"IconSize", 1, settingsFile_.c_str()), 0, 2);
+    setTileSize(iconSize_);
+    alignToGrid_ = GetPrivateProfileIntW(L"DriftTable", L"AlignToGrid", 1, settingsFile_.c_str()) != 0;
+    showIcons_ = GetPrivateProfileIntW(L"DriftTable", L"ShowIcons", 1, settingsFile_.c_str()) != 0;
 }
 
 void App::saveSettings() {
@@ -381,6 +482,9 @@ void App::saveSettings() {
     WritePrivateProfileStringW(L"DriftTable", L"PenColor", buf, settingsFile_.c_str());
     WritePrivateProfileStringW(L"DriftTable", L"PenWidth", std::to_wstring(penWidthIndex_).c_str(),
                                settingsFile_.c_str());
+    WritePrivateProfileStringW(L"DriftTable", L"IconSize", std::to_wstring(iconSize_).c_str(), settingsFile_.c_str());
+    WritePrivateProfileStringW(L"DriftTable", L"AlignToGrid", alignToGrid_ ? L"1" : L"0", settingsFile_.c_str());
+    WritePrivateProfileStringW(L"DriftTable", L"ShowIcons", showIcons_ ? L"1" : L"0", settingsFile_.c_str());
 }
 
 bool App::autostartEnabled() const {
@@ -547,7 +651,12 @@ LRESULT App::onCanvasMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     LRESULT menuResult;
     if (shell::handleMenuMessage(msg, wp, lp, &menuResult)) return menuResult;
 
-    auto pt = [lp] { return Vec2((short)LOWORD(lp), (short)HIWORD(lp)); };
+    // Mouse coordinates are per window; the app works in canvas coordinates,
+    // which span every surface (the virtual screen in overlay mode).
+    const Surface* surface = surfaceOf(hwnd);
+    double ox = surface ? surface->rect.left : 0, oy = surface ? surface->rect.top : 0;
+    auto pt = [&] { return Vec2((short)LOWORD(lp) + ox, (short)HIWORD(lp) + oy); };
+    if (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST) inputWnd_ = hwnd;
     switch (msg) {
     case WM_LBUTTONDOWN: onMouseDown(0, pt(), false); return 0;
     case WM_LBUTTONDBLCLK: onMouseDown(0, pt(), true); return 0;
@@ -624,7 +733,7 @@ LRESULT App::onCanvasMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_DESTROY:
         RevokeDragDrop(hwnd);
-        if (hwnd == canvas_) onCanvasDestroyed();
+        onCanvasDestroyed(hwnd);
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);

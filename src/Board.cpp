@@ -4,6 +4,17 @@
 
 namespace dt {
 
+TileMetrics& tile() {
+    static TileMetrics t{84, 94, 48};
+    return t;
+}
+
+void setTileSize(int size) {
+    // Icon box, then the label: 4 DIP gap + two 16 DIP lines + padding.
+    static const TileMetrics sizes[] = {{76, 78, 32}, {84, 94, 48}, {120, 142, 96}};
+    tile() = sizes[std::clamp(size, 0, 2)];
+}
+
 void Item::recomputeStrokeBounds() {
     if (pts.empty()) {
         w = h = 0;
@@ -177,8 +188,8 @@ bool Board::load(const std::wstring& file, CameraState& camera) {
             it.kind = ItemKind::File;
             it.x = r.num();
             it.y = r.num();
-            it.w = kTileW;
-            it.h = kTileH;
+            it.w = tile().w;
+            it.h = tile().h;
             it.path = r.rest();
         } else if (kind == L"picture") {
             it.kind = ItemKind::Picture;

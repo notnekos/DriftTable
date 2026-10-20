@@ -66,26 +66,43 @@ IDWriteTextLayout* App::labelLayout(const Item& it, float width, int maxLines) {
 }
 
 void App::render() {
-    ID2D1RenderTarget* rt = renderer_.beginDraw();
-    if (!rt) return;
     dirty_ = false;
+    // Is anything on screen at all? (for the "nothing here" hint)
+    const double s = scale();
+    RectD all = RectD{camX_, camY_, width_ / s, height_ / s};
+    anyVisible_ = false;
+    for (auto& it : board_.items)
+        if (itemVisible(it) && it.rect().intersects(all)) {
+            anyVisible_ = true;
+            break;
+        }
+    for (size_t i = 0; i < surfaces_.size(); ++i) renderSurface(i);
+}
+
+void App::renderSurface(size_t index) {
+    const Surface& surface = surfaces_[index];
+    ID2D1RenderTarget* rt = renderer_.beginDraw(index);
+    if (!rt) return;
+    surfaceRect_ = surface.rect;
+    surfaceBase_ = D2D1::Matrix3x2F::Translation((float)-surface.rect.left, (float)-surface.rect.top);
+    rt->SetTransform(surfaceBase_);
 
     drawBackground(rt);
     drawGrid(rt);
 
     const double s = scale();
-    D2D1::Matrix3x2F view =
-        D2D1::Matrix3x2F::Translation((float)-camX_, (float)-camY_) * D2D1::Matrix3x2F::Scale((float)s, (float)s);
+    D2D1::Matrix3x2F view = D2D1::Matrix3x2F::Translation((float)-camX_, (float)-camY_) *
+                            D2D1::Matrix3x2F::Scale((float)s, (float)s) * surfaceBase_;
     rt->SetTransform(view);
 
-    RectD visible{camX_, camY_, width_ / s, height_ / s};
+    RectD visible{camX_ + surface.rect.left / s, camY_ + surface.rect.top / s,
+                  (surface.rect.right - surface.rect.left) / s, (surface.rect.bottom - surface.rect.top) / s};
     visible = visible.inflated(24 / s);
-    int shown = 0;
     for (auto& it : board_.items) {
+        if (!itemVisible(it)) continue;
         RectD r = it.rect().inflated(it.kind == ItemKind::Stroke ? it.strokeWidth : 0);
         if (it.kind == ItemKind::Stroke && it.id == drawingId_) r = visible; // bounds not final yet
         if (!r.intersects(visible)) continue;
-        ++shown;
         drawItem(rt, it, selected_.count(it.id) != 0, it.id == hoverId_);
         rt->SetTransform(view);
     }
@@ -105,7 +122,7 @@ void App::render() {
                                  renderer_.dashStroke());
     }
 
-    rt->SetTransform(D2D1::Matrix3x2F::Identity());
+    rt->SetTransform(surfaceBase_);
 
     // Eraser cursor.
     if (tool_ == Tool::Eraser && cursor_.x > -1000) {
@@ -117,20 +134,19 @@ void App::render() {
     drawHud(rt);
 
     // "Nothing here": help finding the way back after drifting away.
-    if (shown == 0 && !board_.items.empty() && !flight_.active) {
+    if (!anyVisible_ && !board_.items.empty() && !flight_.active) {
         RECT pa = primaryWorkArea();
         float d = (float)dpi_;
         float cx = (pa.left + pa.right) / 2.f / d, by = pa.bottom / d;
-        rt->SetTransform(D2D1::Matrix3x2F::Scale(d, d));
+        rt->SetTransform(D2D1::Matrix3x2F::Scale(d, d) * surfaceBase_);
         D2D1_RECT_F r = D2D1::RectF(cx - 150, by - 96, cx + 150, by - 62);
         drawPill(rt, r, 0.8f);
         const wchar_t* text = L"Здесь пусто · Home — вернуться к началу";
         rt->DrawText(text, (UINT32)wcslen(text), renderer_.hudFormat(), r,
                      renderer_.brush(D2D1::ColorF(1, 1, 1, 0.85f)));
-        rt->SetTransform(D2D1::Matrix3x2F::Identity());
     }
 
-    if (!renderer_.endDraw(canvas_, mode_ != HostMode::Window)) {
+    if (!renderer_.endDraw(index, surface.hwnd, mode_ != HostMode::Window)) {
         board_.clearCaches();
         invalidate();
     }
@@ -169,8 +185,13 @@ void App::drawGrid(ID2D1RenderTarget* rt) {
     double startX = std::floor(camX_ / spacing) * spacing, startY = std::floor(camY_ / spacing) * spacing;
     float size = 2.f * (float)dpi_;
     auto* b = renderer_.brush(D2D1::ColorF(1, 1, 1, (float)(0.28 * std::min(1.0, gridAlpha_))));
-    for (double sy = (startY - camY_) * s; sy < height_; sy += step) {
-        for (double sx = (startX - camX_) * s; sx < width_; sx += step) {
+    // Only the part of the canvas this surface shows.
+    double x0 = surfaceRect_.left, y0 = surfaceRect_.top;
+    double firstX = (startX - camX_) * s, firstY = (startY - camY_) * s;
+    if (firstX < x0) firstX += std::floor((x0 - firstX) / step) * step;
+    if (firstY < y0) firstY += std::floor((y0 - firstY) / step) * step;
+    for (double sy = firstY; sy < surfaceRect_.bottom; sy += step) {
+        for (double sx = firstX; sx < surfaceRect_.right; sx += step) {
             rt->FillRectangle(D2D1::RectF((float)sx - size / 2, (float)sy - size / 2, (float)sx + size / 2,
                                           (float)sy + size / 2),
                               b);
@@ -204,8 +225,8 @@ void App::drawFile(ID2D1RenderTarget* rt, const Item& it, bool selected, bool ho
     // Label first: a selected tile grows to show the full name, like Explorer.
     IDWriteTextLayout* label = nullptr;
     float labelH = 0;
-    float labelX = (float)it.x + 4, labelY = (float)(it.y + 6 + kIconSize + 4);
-    float labelW = (float)kTileW - 8;
+    float labelX = (float)it.x + 4, labelY = (float)(it.y + 6 + tile().icon + 4);
+    float labelW = (float)tile().w - 8;
     if (showLabel && !renaming) {
         label = labelLayout(it, labelW, selected ? 12 : 2);
         if (label) {
@@ -215,9 +236,9 @@ void App::drawFile(ID2D1RenderTarget* rt, const Item& it, bool selected, bool ho
         }
     }
 
-    D2D1_RECT_F tile = rectF(it.rect());
-    if (selected && labelH > 0) tile.bottom = std::max(tile.bottom, labelY + labelH + 4);
-    D2D1_ROUNDED_RECT rr{tile, 6, 6};
+    D2D1_RECT_F tileRect = rectF(it.rect());
+    if (selected && labelH > 0) tileRect.bottom = std::max(tileRect.bottom, labelY + labelH + 4);
+    D2D1_ROUNDED_RECT rr{tileRect, 6, 6};
     if (selected) {
         rt->FillRoundedRectangle(rr, renderer_.brush(argb(kAccent, 0.32f)));
         rt->DrawRoundedRectangle(rr, renderer_.brush(argb(kAccent, 0.8f)), (float)(1 / s));
@@ -226,14 +247,14 @@ void App::drawFile(ID2D1RenderTarget* rt, const Item& it, bool selected, bool ho
     }
 
     // Icon or thumbnail, aspect preserved inside the icon box.
-    D2D1_RECT_F box = rectF(it.x + (kTileW - kIconSize) / 2, it.y + 6, kIconSize, kIconSize);
+    D2D1_RECT_F box = rectF(it.x + (tile().w - tile().icon) / 2, it.y + 6, tile().icon, tile().icon);
     Image* img = imageFor(it);
     ID2D1Bitmap* bmp = img ? renderer_.bitmapFor(*img) : nullptr;
     if (bmp) {
         double iw = img->width, ih = img->height;
-        double f = std::min(kIconSize / iw, kIconSize / ih);
+        double f = std::min(tile().icon / iw, tile().icon / ih);
         double dw = iw * f, dh = ih * f;
-        D2D1_RECT_F dst = rectF(box.left + (kIconSize - dw) / 2, box.top + (kIconSize - dh), dw, dh);
+        D2D1_RECT_F dst = rectF(box.left + (tile().icon - dw) / 2, box.top + (tile().icon - dh), dw, dh);
         rt->DrawBitmap(bmp, dst, 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
     } else {
         D2D1_ROUNDED_RECT ph{D2D1::RectF(box.left + 8, box.top + 8, box.right - 8, box.bottom - 8), 6, 6};
@@ -242,13 +263,13 @@ void App::drawFile(ID2D1RenderTarget* rt, const Item& it, bool selected, bool ho
 
     if (renaming) {
         ComPtr<IDWriteTextLayout> edit;
-        float w = (float)kTileW + 40;
+        float w = (float)tile().w + 40;
         renderer_.dwrite()->CreateTextLayout(editText_.c_str(), (UINT32)editText_.size(), renderer_.labelFormat(), w,
                                              400.f, &edit);
         if (!edit) return;
         DWRITE_TEXT_METRICS m{};
         edit->GetMetrics(&m);
-        float x = (float)(it.x + kTileW / 2 - w / 2);
+        float x = (float)(it.x + tile().w / 2 - w / 2);
         D2D1_ROUNDED_RECT bg{D2D1::RectF(x - 2, labelY - 2, x + w + 2, labelY + std::max(m.height, 16.f) + 2), 3, 3};
         rt->FillRoundedRectangle(bg, renderer_.brush(D2D1::ColorF(1, 1, 1, 0.97f)));
         rt->DrawRoundedRectangle(bg, renderer_.brush(argb(kAccent)), (float)(1.5 / s));
@@ -366,7 +387,7 @@ void App::drawHud(ID2D1RenderTarget* rt) {
     hud_.clear();
     RECT pa = primaryWorkArea();
     float d = (float)dpi_;
-    rt->SetTransform(D2D1::Matrix3x2F::Scale(d, d));
+    rt->SetTransform(D2D1::Matrix3x2F::Scale(d, d) * surfaceBase_);
     auto addButton = [&](D2D1_RECT_F r, int action) {
         hud_.push_back({D2D1::RectF(r.left * d, r.top * d, r.right * d, r.bottom * d), action});
     };
@@ -439,7 +460,7 @@ void App::drawHud(ID2D1RenderTarget* rt) {
         drawPill(rt, r, a);
         rt->DrawText(text, (UINT32)wcslen(text), renderer_.hudFormat(), r, white(a));
     }
-    rt->SetTransform(D2D1::Matrix3x2F::Identity());
+    rt->SetTransform(surfaceBase_);
 }
 
 } // namespace dt

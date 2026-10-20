@@ -13,22 +13,22 @@ inline D2D1_COLOR_F argb(uint32_t c, float alphaMul = 1.f) {
                         ((c >> 24) & 0xFF) / 255.f * alphaMul);
 }
 
-// Direct2D renderer that draws into a 32-bit premultiplied DIB. In layered mode
-// the DIB is pushed with UpdateLayeredWindow, so the wallpaper (static, Lively,
-// Wallpaper Engine, ...) shows through every transparent pixel.
+// Direct2D renderer that draws into 32-bit premultiplied DIBs, one per canvas
+// window (surface). In layered mode a DIB is pushed with UpdateLayeredWindow, so
+// the wallpaper (static, Lively, Wallpaper Engine, ...) shows through every
+// transparent pixel.
 class Renderer {
 public:
     ~Renderer();
     bool init();
-    void resize(int width, int height);
-    int width() const { return width_; }
-    int height() const { return height_; }
+    void setSurfaceCount(size_t count);
+    void resize(size_t surface, int width, int height);
 
     // Returns null if nothing can be drawn right now.
-    ID2D1RenderTarget* beginDraw();
+    ID2D1RenderTarget* beginDraw(size_t surface);
     // Ends drawing and shows the frame on the window.
     // Returns false if the frame was lost and has to be drawn again.
-    bool endDraw(HWND hwnd, bool layered);
+    bool endDraw(size_t surface, HWND hwnd, bool layered);
 
     ID2D1Factory* factory() const { return factory_.Get(); }
     IDWriteFactory* dwrite() const { return dwrite_.Get(); }
@@ -42,8 +42,16 @@ public:
     IDWriteTextFormat* hudFormat() const { return hudFormat_.Get(); }
 
 private:
+    struct Surface {
+        HDC dc = nullptr;
+        HBITMAP dib = nullptr;
+        HGDIOBJ old = nullptr;
+        int width = 0, height = 0;
+        bool shown = false;
+        void release();
+    };
+
     bool createTarget();
-    void releaseSurface();
 
     ComPtr<ID2D1Factory> factory_;
     ComPtr<IDWriteFactory> dwrite_;
@@ -52,10 +60,7 @@ private:
     ComPtr<ID2D1StrokeStyle> roundStroke_, dashStroke_;
     ComPtr<IDWriteTextFormat> labelFormat_, noteFormat_, hudFormat_;
 
-    HDC memDC_ = nullptr;
-    HBITMAP dib_ = nullptr;
-    HGDIOBJ oldBitmap_ = nullptr;
-    int width_ = 0, height_ = 0;
+    std::vector<Surface> surfaces_;
     uint32_t generation_ = 1;
 };
 

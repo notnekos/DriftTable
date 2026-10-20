@@ -8,8 +8,6 @@ namespace {
 
 constexpr wchar_t kRecycleBin[] = L"::{645FF040-5081-101B-9F08-00AA002F954E}";
 constexpr wchar_t kThisPc[] = L"::{20D04FE0-3AEA-1069-A2D8-08002B30309D}";
-constexpr double kCellW = kTileW + 2;
-constexpr double kCellH = kTileH + 4;
 constexpr double kNotePad = 12;
 constexpr uint32_t kDefaultNoteColor = 0xFFFFF3A6;
 
@@ -67,10 +65,14 @@ void App::saveNow() {
 // ---------------------------------------------------------------------------
 
 Vec2 App::findFreeSlot(Vec2 origin, double columnHeight) const {
-    int rows = std::max(1, (int)(columnHeight / kCellH));
+    if (alignToGrid_) {
+        origin.x = std::ceil(origin.x / tile().cellW()) * tile().cellW();
+        origin.y = std::ceil(origin.y / tile().cellH()) * tile().cellH();
+    }
+    int rows = std::max(1, (int)(columnHeight / tile().cellH()));
     for (int col = 0; col < 1000; ++col) {
         for (int row = 0; row < rows; ++row) {
-            RectD cell{origin.x + col * kCellW, origin.y + row * kCellH, kTileW, kTileH};
+            RectD cell{origin.x + col * tile().cellW(), origin.y + row * tile().cellH(), tile().w, tile().h};
             bool free = true;
             for (auto& it : board_.items) {
                 if (it.kind == ItemKind::Stroke) continue; // drawings may overlap files
@@ -120,27 +122,182 @@ void App::syncDesktop() {
         const Item& it = board_.items[*i];
         selected_.erase(it.id);
         if (hoverId_ == it.id) hoverId_ = 0;
-        images_.erase(L"icon:" + toLower(it.path));
+        images_.erase(iconKey(it.path));
         board_.items.erase(board_.items.begin() + *i);
     }
 
     RECT pa = primaryWorkArea();
     Vec2 origin = toWorld({pa.left + 24.0, pa.top + 24.0});
     double columnHeight = (pa.bottom - pa.top - 48) / scale();
+    // Created from the desktop menu (New > ...): appear where the menu was opened.
+    bool anchored = seconds() < newFileAnchorUntil_;
+    if (anchored) {
+        origin = newFileAnchor_;
+        columnHeight = tile().cellH() * 4;
+    }
+    uint64_t lastAdded = 0;
     for (auto& path : added) {
         Item it;
         it.kind = ItemKind::File;
         it.path = path;
-        it.w = kTileW;
-        it.h = kTileH;
+        it.w = tile().w;
+        it.h = tile().h;
         auto pending = pendingPos_.find(toLower(path));
         Vec2 pos = pending != pendingPos_.end() ? pending->second : findFreeSlot(origin, columnHeight);
         if (pending != pendingPos_.end()) pendingPos_.erase(pending);
         it.x = pos.x;
         it.y = pos.y;
-        board_.add(std::move(it));
+        lastAdded = board_.add(std::move(it));
+    }
+    if (alignToGrid_ && !added.empty()) {
+        std::vector<uint64_t> ids;
+        for (size_t i = board_.items.size() - added.size(); i < board_.items.size(); ++i)
+            ids.push_back(board_.items[i].id);
+        snapToGrid(ids);
+    }
+    // Like Explorer after New > Text Document: straight into renaming.
+    if (anchored && added.size() == 1 && missing.empty()) {
+        newFileAnchorUntil_ = 0;
+        beginEdit(lastAdded, true);
     }
     scheduleSave();
+    invalidate();
+}
+
+// ---------------------------------------------------------------------------
+// View: icon size, grid, arranging
+// ---------------------------------------------------------------------------
+
+void App::setIconSize(int size) {
+    size = std::clamp(size, 0, 2);
+    if (size == iconSize_) return;
+    double oldW = tile().cellW(), oldH = tile().cellH();
+    setTileSize(size);
+    iconSize_ = size;
+    // Scale file positions with the grid, so arranged icons stay arranged.
+    board_.pushUndo();
+    for (auto& it : board_.items) {
+        if (it.kind != ItemKind::File) continue;
+        it.x = it.x / oldW * tile().cellW();
+        it.y = it.y / oldH * tile().cellH();
+        it.w = tile().w;
+        it.h = tile().h;
+        it.layout.Reset();
+    }
+    if (alignToGrid_) snapToGrid({});
+    saveSettings();
+    scheduleSave();
+    invalidate();
+}
+
+// Snaps the given file items (all of them when empty) to free grid cells.
+void App::snapToGrid(const std::vector<uint64_t>& ids) {
+    const double cw = tile().cellW(), ch = tile().cellH();
+    auto cellOf = [&](const Item& it) { return std::make_pair((long)std::lround(it.x / cw), (long)std::lround(it.y / ch)); };
+    std::set<uint64_t> moving(ids.begin(), ids.end());
+    bool all = ids.empty();
+    std::set<std::pair<long, long>> taken;
+    for (auto& it : board_.items)
+        if (it.kind == ItemKind::File && !all && !moving.count(it.id)) taken.insert(cellOf(it));
+    for (auto& it : board_.items) {
+        if (it.kind != ItemKind::File || (!all && !moving.count(it.id))) continue;
+        auto want = cellOf(it);
+        std::pair<long, long> got = want;
+        // Nearest free cell, searching outwards ring by ring.
+        for (long r = 0; r < 64; ++r) {
+            bool found = false;
+            double best = 1e18;
+            for (long dy = -r; dy <= r; ++dy)
+                for (long dx = -r; dx <= r; ++dx) {
+                    if (std::max(std::labs(dx), std::labs(dy)) != r) continue;
+                    std::pair<long, long> c{want.first + dx, want.second + dy};
+                    if (taken.count(c)) continue;
+                    double d = std::hypot(c.first * cw - it.x, c.second * ch - it.y);
+                    if (d < best) {
+                        best = d;
+                        got = c;
+                        found = true;
+                    }
+                }
+            if (found) break;
+        }
+        taken.insert(got);
+        it.x = got.first * cw;
+        it.y = got.second * ch;
+    }
+    invalidate();
+}
+
+void App::setAlignToGrid(bool on) {
+    alignToGrid_ = on;
+    if (on) {
+        board_.pushUndo();
+        snapToGrid({});
+        scheduleSave();
+    }
+    saveSettings();
+}
+
+// Sort by: lays every file out in columns from the start of the canvas.
+void App::arrangeFiles(SortKey key) {
+    struct Entry {
+        Item* item;
+        std::wstring name, ext;
+        bool dir, virt;
+        uint64_t size, time;
+    };
+    std::vector<Entry> entries;
+    for (auto& it : board_.items) {
+        if (it.kind != ItemKind::File) continue;
+        Entry e{&it, labelFor(it), extensionOf(it.path), false, it.isVirtual(), 0, 0};
+        WIN32_FILE_ATTRIBUTE_DATA fa;
+        if (!e.virt && GetFileAttributesExW(it.path.c_str(), GetFileExInfoStandard, &fa)) {
+            e.dir = (fa.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            e.size = ((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+            e.time = ((uint64_t)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime;
+        }
+        entries.push_back(e);
+    }
+    std::stable_sort(entries.begin(), entries.end(), [key](const Entry& a, const Entry& b) {
+        if (a.virt != b.virt) return a.virt; // Recycle Bin, This PC first
+        if (a.dir != b.dir) return a.dir;    // then folders
+        int byName = StrCmpLogicalW(a.name.c_str(), b.name.c_str());
+        switch (key) {
+        case SortKey::Size:
+            if (a.size != b.size) return a.size > b.size;
+            break;
+        case SortKey::Type: {
+            int c = StrCmpLogicalW(a.ext.c_str(), b.ext.c_str());
+            if (c) return c < 0;
+            break;
+        }
+        case SortKey::Date:
+            if (a.time != b.time) return a.time > b.time; // newest first
+            break;
+        case SortKey::Name: break;
+        }
+        return byName < 0;
+    });
+
+    board_.pushUndo();
+    RECT pa = primaryWorkArea();
+    int rows = std::max(1, (int)((pa.bottom - pa.top - 48) / dpi_ / tile().cellH()));
+    for (size_t i = 0; i < entries.size(); ++i) {
+        entries[i].item->x = (double)(i / rows) * tile().cellW();
+        entries[i].item->y = (double)(i % rows) * tile().cellH();
+    }
+    scheduleSave();
+    resetView();
+}
+
+void App::setShowIcons(bool on) {
+    showIcons_ = on;
+    if (!on) {
+        for (auto& it : board_.items)
+            if (it.kind == ItemKind::File) selected_.erase(it.id);
+        hoverId_ = 0;
+    }
+    saveSettings();
     invalidate();
 }
 
@@ -155,8 +312,8 @@ void App::addSystemIcons() {
         Item it;
         it.kind = ItemKind::File;
         it.path = path;
-        it.w = kTileW;
-        it.h = kTileH;
+        it.w = tile().w;
+        it.h = tile().h;
         Vec2 pos = findFreeSlot({0, 0}, columnHeight);
         it.x = pos.x;
         it.y = pos.y;
@@ -178,14 +335,21 @@ void App::refresh() {
 // Images
 // ---------------------------------------------------------------------------
 
+// Icons are loaded at twice the tile size so they stay sharp when zooming in.
+int App::iconPixels() const { return std::clamp((int)(tile().icon * dpi_ * 2), 64, 256); }
+
+std::wstring App::iconKey(const std::wstring& path) const {
+    return L"icon" + std::to_wstring(iconPixels()) + L":" + toLower(path);
+}
+
 Image* App::imageFor(const Item& it) {
     if (it.kind != ItemKind::File && it.kind != ItemKind::Picture) return nullptr;
-    std::wstring key = (it.kind == ItemKind::File ? L"icon:" : L"pic:") + toLower(it.path);
+    std::wstring key = it.kind == ItemKind::File ? iconKey(it.path) : L"pic:" + toLower(it.path);
     auto found = images_.find(key);
     if (found != images_.end()) return found->second.get();
     if (pendingImages_.insert(key).second) {
         if (it.kind == ItemKind::File)
-            loader_.requestIcon(key, it.path, std::clamp((int)(kIconSize * dpi_ * 2), 64, 256));
+            loader_.requestIcon(key, it.path, iconPixels());
         else
             loader_.requestPicture(key, it.path, 2048);
     }
@@ -196,7 +360,8 @@ void App::onImagesLoaded() {
     for (auto& r : loader_.takeResults()) {
         pendingImages_.erase(r.key);
         images_[r.key] = r.image;
-        if (!r.displayName.empty() && r.key.rfind(L"icon:", 0) == 0) displayNames_[r.key.substr(5)] = r.displayName;
+        if (!r.displayName.empty() && r.key.rfind(L"icon", 0) == 0)
+            displayNames_[r.key.substr(r.key.find(L':') + 1)] = r.displayName;
     }
     invalidate();
 }
@@ -257,7 +422,7 @@ void App::processDrops() {
         bool undoPushed = false;
         for (size_t i = 0; i < d.files.size(); ++i) {
             const std::wstring& f = d.files[i];
-            Vec2 pos{at.x - kTileW / 2 + (i % cols) * kCellW, at.y - kIconSize / 2 - 6 + (i / cols) * kCellH};
+            Vec2 pos{at.x - tile().w / 2 + (i % cols) * tile().cellW(), at.y - tile().icon / 2 - 6 + (i / cols) * tile().cellH()};
             if (folders_.isInDesktop(f)) {
                 int idx = -1;
                 for (size_t k = 0; k < board_.items.size(); ++k)
@@ -268,6 +433,7 @@ void App::processDrops() {
                     undoPushed = true;
                     board_.items[idx].x = pos.x;
                     board_.items[idx].y = pos.y;
+                    if (alignToGrid_) snapToGrid({board_.items[idx].id});
                 } else {
                     pendingPos_[toLower(f)] = pos;
                 }

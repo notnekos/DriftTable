@@ -12,10 +12,15 @@ namespace dt {
 
 enum class ItemKind { File, Picture, Note, Stroke };
 
-// Size of a file tile in world units (1 unit == 1 DIP at 100% zoom).
-constexpr double kTileW = 96.0;
-constexpr double kTileH = 108.0;
-constexpr double kIconSize = 64.0;
+// Size of a file tile in world units (1 unit == 1 DIP at 100% zoom), set by
+// View > Large / Medium / Small icons like on the Windows desktop.
+struct TileMetrics {
+    double w, h, icon;
+    double cellW() const { return w + 2; } // grid used for arranging and snapping
+    double cellH() const { return h + 4; }
+};
+TileMetrics& tile();
+void setTileSize(int size); // 0 small, 1 medium, 2 large
 
 struct PointF {
     float x, y;

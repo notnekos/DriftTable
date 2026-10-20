@@ -7,6 +7,8 @@
 #include <shobjidl.h>
 #include <wincodec.h>
 
+#include <cstring>
+
 namespace dt {
 
 namespace {
@@ -89,6 +91,33 @@ std::shared_ptr<Image> fromHBitmap(HBITMAP hbm) {
         }
     }
     return img;
+}
+
+// Shortcuts to apps that ship only small icons come back as a 16-32 px picture in
+// the middle of a big transparent square. Crop that padding so they fill the tile.
+void trimPadding(Image& img) {
+    int w = img.width, h = img.height;
+    int minX = w, minY = h, maxX = -1, maxY = -1;
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            if (img.pixels[((size_t)y * w + x) * 4 + 3] > 8) {
+                minX = std::min(minX, x);
+                maxX = std::max(maxX, x);
+                minY = std::min(minY, y);
+                maxY = std::max(maxY, y);
+            }
+    if (maxX < 0) return;
+    int side = std::max(maxX - minX + 1, maxY - minY + 1);
+    if (side * 100 >= std::max(w, h) * 55) return; // normal icon
+    side += side / 5;                               // keep a little air around it
+    if (side > w || side > h) return;
+    int x0 = std::clamp((minX + maxX + 1) / 2 - side / 2, 0, w - side);
+    int y0 = std::clamp((minY + maxY + 1) / 2 - side / 2, 0, h - side);
+    std::vector<uint8_t> out((size_t)side * side * 4);
+    for (int y = 0; y < side; ++y)
+        memcpy(&out[(size_t)y * side * 4], &img.pixels[((size_t)(y0 + y) * w + x0) * 4], (size_t)side * 4);
+    img.pixels.swap(out);
+    img.width = img.height = side;
 }
 
 bool isBlank(const Image& img) {
@@ -238,6 +267,7 @@ LoadResult ImageLoader::loadIcon(const Job& job) {
         }
     }
     if (!r.image || isBlank(*r.image)) r.image = systemIcon(job.path, job.size);
+    if (r.image) trimPadding(*r.image);
     return r;
 }
 

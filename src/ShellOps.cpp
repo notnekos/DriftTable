@@ -145,6 +145,67 @@ UINT contextMenu(HWND owner, const std::vector<std::wstring>& paths, POINT scree
     return result;
 }
 
+bool BackgroundMenu::insert(HWND owner, HMENU menu, UINT position) {
+    ComPtr<IShellFolder> desktop;
+    if (FAILED(SHGetDesktopFolder(&desktop))) return false;
+    if (FAILED(desktop->CreateViewObject(owner, IID_IContextMenu, reinterpret_cast<void**>(menu_.GetAddressOf()))))
+        return false;
+    int before = GetMenuItemCount(menu);
+    UINT flags = CMF_NORMAL | CMF_NODEFAULT;
+    if (GetKeyState(VK_SHIFT) < 0) flags |= CMF_EXTENDEDVERBS;
+    if (FAILED(menu_->QueryContextMenu(menu, position, 1, kExtraMenuBase - 1, flags))) {
+        menu_.Reset();
+        return false;
+    }
+    // We have our own Paste (it also pastes pictures and text) and View/Sort/Refresh.
+    for (int i = GetMenuItemCount(menu) - 1; i >= 0; --i) {
+        UINT id = GetMenuItemID(menu, i);
+        if (id == 0 || id == (UINT)-1 || id >= kExtraMenuBase) continue;
+        wchar_t verb[64] = {};
+        if (FAILED(menu_->GetCommandString(id - 1, GCS_VERBW, nullptr, reinterpret_cast<LPSTR>(verb), 64))) continue;
+        if (!_wcsicmp(verb, L"paste") || !_wcsicmp(verb, L"pastelink") || !_wcsicmp(verb, L"refresh"))
+            DeleteMenu(menu, i, MF_BYPOSITION);
+    }
+    // No double separators where items were removed.
+    for (int i = GetMenuItemCount(menu) - 1; i > 0; --i) {
+        MENUITEMINFOW a{}, b{};
+        a.cbSize = b.cbSize = sizeof(a);
+        a.fMask = b.fMask = MIIM_FTYPE;
+        GetMenuItemInfoW(menu, i, TRUE, &a);
+        GetMenuItemInfoW(menu, i - 1, TRUE, &b);
+        if ((a.fType & MFT_SEPARATOR) && (b.fType & MFT_SEPARATOR)) DeleteMenu(menu, i, MF_BYPOSITION);
+    }
+    menu_.As(&g_menu2);
+    menu_.As(&g_menu3);
+    return GetMenuItemCount(menu) > before;
+}
+
+UINT BackgroundMenu::track(HWND owner, HMENU menu, POINT screenPt, const std::wstring& directory, bool* shellCommand) {
+    *shellCommand = false;
+    if (menu_) {
+        menu_.As(&g_menu2);
+        menu_.As(&g_menu3);
+    }
+    UINT cmd = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screenPt.x, screenPt.y, owner, nullptr);
+    g_menu2.Reset();
+    g_menu3.Reset();
+    if (cmd >= kExtraMenuBase || cmd == 0 || !menu_) return cmd >= kExtraMenuBase ? cmd : 0;
+
+    CMINVOKECOMMANDINFOEX info{};
+    info.cbSize = sizeof(info);
+    info.fMask = CMIC_MASK_UNICODE | CMIC_MASK_PTINVOKE | CMIC_MASK_ASYNCOK;
+    info.hwnd = owner;
+    info.lpVerb = MAKEINTRESOURCEA(cmd - 1);
+    info.lpVerbW = MAKEINTRESOURCEW(cmd - 1);
+    info.lpDirectoryW = directory.c_str();
+    info.nShow = SW_SHOWNORMAL;
+    info.ptInvoke = screenPt;
+    AllowSetForegroundWindow(ASFW_ANY);
+    menu_->InvokeCommand(reinterpret_cast<CMINVOKECOMMANDINFO*>(&info));
+    *shellCommand = true;
+    return 0;
+}
+
 bool handleMenuMessage(UINT msg, WPARAM wp, LPARAM lp, LRESULT* result) {
     if (g_menu3) {
         LRESULT r = 0;

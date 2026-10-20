@@ -2,7 +2,9 @@
 
 namespace dt {
 
-Renderer::~Renderer() { releaseSurface(); }
+Renderer::~Renderer() {
+    for (auto& sf : surfaces_) sf.release();
+}
 
 bool Renderer::init() {
     if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, factory_.GetAddressOf()))) return false;
@@ -56,40 +58,46 @@ bool Renderer::init() {
     return true;
 }
 
-void Renderer::releaseSurface() {
-    if (memDC_) {
-        if (oldBitmap_) SelectObject(memDC_, oldBitmap_);
-        DeleteDC(memDC_);
-        memDC_ = nullptr;
+void Renderer::Surface::release() {
+    if (dc) {
+        if (old) SelectObject(dc, old);
+        DeleteDC(dc);
     }
-    if (dib_) {
-        DeleteObject(dib_);
-        dib_ = nullptr;
-    }
-    oldBitmap_ = nullptr;
+    if (dib) DeleteObject(dib);
+    dc = nullptr;
+    dib = nullptr;
+    old = nullptr;
+    width = height = 0;
 }
 
-void Renderer::resize(int width, int height) {
+void Renderer::setSurfaceCount(size_t count) {
+    for (size_t i = count; i < surfaces_.size(); ++i) surfaces_[i].release();
+    surfaces_.resize(count);
+}
+
+void Renderer::resize(size_t surface, int width, int height) {
+    if (surface >= surfaces_.size()) return;
+    Surface& sf = surfaces_[surface];
     width = std::max(1, width);
     height = std::max(1, height);
-    if (width == width_ && height == height_ && dib_) return;
-    releaseSurface();
-    width_ = width;
-    height_ = height;
+    if (width == sf.width && height == sf.height && sf.dib) return;
+    sf.release();
+    sf.width = width;
+    sf.height = height;
 
     BITMAPINFO bi{};
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = width_;
-    bi.bmiHeader.biHeight = -height_;
+    bi.bmiHeader.biWidth = width;
+    bi.bmiHeader.biHeight = -height;
     bi.bmiHeader.biPlanes = 1;
     bi.bmiHeader.biBitCount = 32;
     bi.bmiHeader.biCompression = BI_RGB;
     void* bits = nullptr;
     HDC screen = GetDC(nullptr);
-    memDC_ = CreateCompatibleDC(screen);
-    dib_ = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    sf.dc = CreateCompatibleDC(screen);
+    sf.dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
     ReleaseDC(nullptr, screen);
-    if (dib_) oldBitmap_ = SelectObject(memDC_, dib_);
+    if (sf.dib) sf.old = SelectObject(sf.dc, sf.dib);
 }
 
 bool Renderer::createTarget() {
@@ -108,11 +116,12 @@ bool Renderer::createTarget() {
     return true;
 }
 
-ID2D1RenderTarget* Renderer::beginDraw() {
-    if (!dib_) return nullptr;
+ID2D1RenderTarget* Renderer::beginDraw(size_t surface) {
+    if (surface >= surfaces_.size() || !surfaces_[surface].dib) return nullptr;
     if (!target_ && !createTarget()) return nullptr;
-    RECT rc{0, 0, width_, height_};
-    HRESULT hr = target_->BindDC(memDC_, &rc);
+    Surface& sf = surfaces_[surface];
+    RECT rc{0, 0, sf.width, sf.height};
+    HRESULT hr = target_->BindDC(sf.dc, &rc);
     if (FAILED(hr)) {
         static bool logged = false;
         if (!logged) logf(L"BindDC failed: 0x%08lX", (unsigned long)hr);
@@ -124,7 +133,8 @@ ID2D1RenderTarget* Renderer::beginDraw() {
     return target_.Get();
 }
 
-bool Renderer::endDraw(HWND hwnd, bool layered) {
+bool Renderer::endDraw(size_t surface, HWND hwnd, bool layered) {
+    Surface& sf = surfaces_[surface];
     HRESULT hr = target_->EndDraw();
     if (FAILED(hr)) logf(L"EndDraw: 0x%08lX", (unsigned long)hr);
     if (hr == (HRESULT)D2DERR_RECREATE_TARGET) {
@@ -133,19 +143,19 @@ bool Renderer::endDraw(HWND hwnd, bool layered) {
         return false;
     }
     if (layered) {
-        SIZE size{width_, height_};
+        SIZE size{sf.width, sf.height};
         POINT src{0, 0};
         BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-        static int reported = 0;
-        if (!UpdateLayeredWindow(hwnd, nullptr, nullptr, &size, memDC_, &src, 0, &blend, ULW_ALPHA)) {
-            if (reported++ < 3) logf(L"UpdateLayeredWindow failed: error %lu", GetLastError());
-        } else if (!reported) {
-            logf(L"first frame shown (%dx%d)", width_, height_);
-            reported = -1000000; // log success once
+        static int failures = 0;
+        if (!UpdateLayeredWindow(hwnd, nullptr, nullptr, &size, sf.dc, &src, 0, &blend, ULW_ALPHA)) {
+            if (failures++ < 3) logf(L"UpdateLayeredWindow failed: error %lu", GetLastError());
+        } else if (!sf.shown) {
+            sf.shown = true;
+            logf(L"surface %u: first frame shown (%dx%d)", (unsigned)surface, sf.width, sf.height);
         }
     } else {
         HDC dc = GetDC(hwnd);
-        BitBlt(dc, 0, 0, width_, height_, memDC_, 0, 0, SRCCOPY);
+        BitBlt(dc, 0, 0, sf.width, sf.height, sf.dc, 0, 0, SRCCOPY);
         ReleaseDC(hwnd, dc);
     }
     return true;

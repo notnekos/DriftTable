@@ -10,6 +10,8 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <cstdarg>
+#include <cstdio>
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -140,6 +142,31 @@ inline bool isImageExtension(const std::wstring& ext) {
 
 inline bool fileExists(const std::wstring& path) {
     return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+// Diagnostic log (%APPDATA%\DriftTable\log.txt), rewritten on every start.
+inline std::wstring& logPath() {
+    static std::wstring path;
+    return path;
+}
+
+inline void logf(const wchar_t* fmt, ...) {
+    if (logPath().empty()) return;
+    wchar_t buf[1024];
+    va_list args;
+    va_start(args, fmt);
+    _vsnwprintf_s(buf, _countof(buf), _TRUNCATE, fmt, args);
+    va_end(args);
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    wchar_t stamp[32];
+    swprintf(stamp, 32, L"%02d:%02d:%02d.%03d ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
+    std::string line = toUtf8(std::wstring(stamp) + buf + L"\r\n");
+    HANDLE h = CreateFileW(logPath().c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD written;
+    WriteFile(h, line.data(), (DWORD)line.size(), &written, nullptr);
+    CloseHandle(h);
 }
 
 // Monotonic time in seconds.

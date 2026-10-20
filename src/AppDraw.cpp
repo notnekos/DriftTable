@@ -96,6 +96,15 @@ void App::render() {
         rt->DrawRectangle(r, renderer_.brush(argb(kAccent, 0.75f)), (float)(1 / s));
     }
 
+    // Overview: where the main screen was before zooming out.
+    if (overview_) {
+        D2D1_RECT_F r = rectF(ovView_);
+        D2D1_ROUNDED_RECT rr{r, (float)(10 / s), (float)(10 / s)};
+        rt->FillRoundedRectangle(rr, renderer_.brush(D2D1::ColorF(1, 1, 1, 0.06f)));
+        rt->DrawRoundedRectangle(rr, renderer_.brush(D2D1::ColorF(1, 1, 1, 0.75f)), (float)(2 / s),
+                                 renderer_.dashStroke());
+    }
+
     rt->SetTransform(D2D1::Matrix3x2F::Identity());
 
     // Eraser cursor.
@@ -411,6 +420,14 @@ void App::drawHud(ID2D1RenderTarget* rt) {
         rt->DrawLine(D2D1::Point2F(c.x - 5, c.y + 5), D2D1::Point2F(c.x + 5, c.y - 5), white(0.8f), 2.f,
                      renderer_.roundStroke());
         addButton(D2D1::RectF(cx, y, cx + btn, y + h), 20);
+    }
+
+    if (overview_ && tool_ == Tool::Select) {
+        const wchar_t* text = L"Обзор · щёлкните, куда перейти · Esc или Tab — назад";
+        float cx = (pa.left + pa.right) / 2.f / d, y = pa.top / d + 14;
+        D2D1_RECT_F r = D2D1::RectF(cx - 210, y, cx + 210, y + 36);
+        drawPill(rt, r, 1.f);
+        rt->DrawText(text, (UINT32)wcslen(text), renderer_.hudFormat(), r, white(0.92f));
     }
 
     if (zoomHudAlpha_ > 0) {

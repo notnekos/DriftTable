@@ -454,8 +454,7 @@ void App::beginEdit(uint64_t id, bool rename) {
     caretOn_ = true;
     selectOnly(id);
     SetTimer(main_, TIMER_CARET, 530, nullptr);
-    if (mode_ == HostMode::Overlay) SetForegroundWindow(canvas_);
-    SetFocus(canvas_);
+    focusCanvas();
     invalidate();
 }
 

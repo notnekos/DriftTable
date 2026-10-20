@@ -20,6 +20,7 @@ enum : UINT {
 enum : UINT {
     TRAY_RESET = 1,
     TRAY_FIT,
+    TRAY_OVERVIEW,
     TRAY_PEN,
     TRAY_HIDE_ICONS,
     TRAY_SYSTEM_ICONS,
@@ -50,6 +51,15 @@ int App::run(HINSTANCE instance, const Options& options) {
     boardFile_ = dataDir_ + L"\\canvas.txt";
     settingsFile_ = dataDir_ + L"\\settings.ini";
     SHCreateDirectoryExW(nullptr, picturesDir_.c_str(), nullptr);
+    logPath() = dataDir_ + L"\\log.txt";
+    DeleteFileW(logPath().c_str());
+    {
+        using RtlGetVersionFn = LONG(WINAPI*)(OSVERSIONINFOW*);
+        OSVERSIONINFOW v{};
+        v.dwOSVersionInfoSize = sizeof(v);
+        if (auto fn = (RtlGetVersionFn)(void*)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion")) fn(&v);
+        logf(L"DriftTable 0.2, Windows %lu.%lu build %lu", v.dwMajorVersion, v.dwMinorVersion, v.dwBuildNumber);
+    }
 
     loadSettings();
     if (options.modeForced) mode_ = options.mode;
@@ -61,9 +71,15 @@ int App::run(HINSTANCE instance, const Options& options) {
     if (!registerClasses()) return 1;
 
     taskbarCreated_ = RegisterWindowMessageW(L"TaskbarCreated");
-    main_ = CreateWindowExW(WS_EX_TOOLWINDOW, kMainClass, L"DriftTable", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr,
-                            instance_, nullptr);
+    // The main window also takes keyboard focus for the overlay canvas, which must
+    // never be activated itself (it would jump above other windows). It is a 1x1
+    // fully transparent tool window, so activating it changes nothing on screen.
+    main_ = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT, kMainClass, L"DriftTable", WS_POPUP,
+                            GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN), 1, 1, nullptr,
+                            nullptr, instance_, nullptr);
     if (!main_) return 1;
+    SetLayeredWindowAttributes(main_, 0, 0, LWA_ALPHA);
+    ShowWindow(main_, SW_SHOWNA);
 
     HDC screen = GetDC(nullptr);
     dpi_ = GetDeviceCaps(screen, LOGPIXELSX) / 96.0;
@@ -119,12 +135,20 @@ bool App::createCanvas(bool startup) {
         host_ = DesktopHost::find();
         g_listView = host_.listView;
         if (!host_.host) {
-            // No Explorer desktop (another shell, or Explorer is not running yet).
+            // No Explorer desktop (another shell, or Explorer is not running yet):
+            // an unowned overlay at the bottom still works.
             if (!startup) return false;
-            mode_ = HostMode::Window;
+            mode_ = HostMode::Overlay;
         }
     }
 
+    {
+        wchar_t cls[64] = L"-";
+        if (host_.host) GetClassNameW(host_.host, cls, 64);
+        logf(L"mode=%s host=%p (%s) defView=%p listView=%p",
+             mode_ == HostMode::Embed ? L"embed" : mode_ == HostMode::Overlay ? L"overlay" : L"window",
+             (void*)host_.host, cls, (void*)host_.defView, (void*)host_.listView);
+    }
     if (mode_ == HostMode::Embed) {
         RECT rc;
         GetClientRect(host_.host, &rc);
@@ -144,10 +168,13 @@ bool App::createCanvas(bool startup) {
         // Owned by the desktop: survives Win+D and never goes below the wallpaper.
         canvas_ = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, kCanvasClass, L"DriftTable",
                                   WS_POPUP, x, y, w, h, host_.host, nullptr, instance_, nullptr);
-        if (!canvas_) return false;
-        HWND above = GetWindow(host_.host, GW_HWNDPREV);
-        SetWindowPos(canvas_, above && above != canvas_ ? above : HWND_BOTTOM, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        if (canvas_) {
+            placeAtBottom();
+        } else if (startup) {
+            mode_ = HostMode::Window;
+        } else {
+            return false;
+        }
     }
     if (mode_ == HostMode::Window) {
         canvas_ = CreateWindowExW(0, kCanvasClass, L"DriftTable — окно", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
@@ -155,6 +182,7 @@ bool App::createCanvas(bool startup) {
         if (!canvas_) return false;
     }
 
+    logf(L"canvas=%p", (void*)canvas_);
     drop_ = new DropTarget(canvas_);
     drop_->onOver = [this](const std::vector<std::wstring>& f, POINT pt, DWORD keys, DWORD allowed) {
         return dropEffect(f, pt, keys, allowed);
@@ -171,6 +199,34 @@ bool App::createCanvas(bool startup) {
     updateBounds();
     return true;
 }
+
+// Overlay: directly above the desktop window, i.e. below every normal window.
+void App::placeAtBottom() {
+    if (mode_ != HostMode::Overlay || !canvas_) return;
+    HWND after = HWND_BOTTOM;
+    if (host_.host) {
+        HWND above = GetWindow(host_.host, GW_HWNDPREV);
+        if (above == canvas_) {
+            ShowWindow(canvas_, SW_SHOWNA);
+            return;
+        }
+        if (above) after = above;
+    }
+    allowZOrder_ = true;
+    SetWindowPos(canvas_, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    allowZOrder_ = false;
+}
+
+void App::focusCanvas() {
+    if (mode_ == HostMode::Overlay) {
+        if (GetForegroundWindow() != main_) SetForegroundWindow(main_);
+        if (GetFocus() != main_) SetFocus(main_);
+    } else if (GetFocus() != canvas_) {
+        SetFocus(canvas_);
+    }
+}
+
+HWND App::menuOwner() const { return mode_ == HostMode::Overlay ? main_ : canvas_; }
 
 void App::onCanvasDestroyed() {
     if (drop_) {
@@ -201,6 +257,7 @@ void App::checkHost() {
             SetWindowPos(canvas_, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     } else if (changed) {
         SetWindowLongPtrW(canvas_, GWLP_HWNDPARENT, (LONG_PTR)h.host);
+        placeAtBottom();
     }
     if (hideIcons_) DesktopHost::setIconsVisible(host_, false);
 
@@ -263,7 +320,7 @@ void App::mainLoop() {
             DispatchMessageW(&msg);
         }
         double now = seconds();
-        bool animating = tick(std::min(now - last, 0.05));
+        bool animating = tick(std::min(now - last, 0.1));
         last = now;
         if (dirty_ && canvas_) render();
 
@@ -303,9 +360,9 @@ void App::quit() {
 
 void App::loadSettings() {
     wchar_t buf[64];
-    GetPrivateProfileStringW(L"DriftTable", L"Mode", L"embed", buf, 64, settingsFile_.c_str());
+    GetPrivateProfileStringW(L"DriftTable", L"HostMode", L"overlay", buf, 64, settingsFile_.c_str());
     std::wstring m = toLower(buf);
-    savedMode_ = m == L"overlay" ? HostMode::Overlay : m == L"window" ? HostMode::Window : HostMode::Embed;
+    savedMode_ = m == L"embed" ? HostMode::Embed : m == L"window" ? HostMode::Window : HostMode::Overlay;
     mode_ = savedMode_;
     hideIcons_ = GetPrivateProfileIntW(L"DriftTable", L"HideDesktopIcons", 1, settingsFile_.c_str()) != 0;
     GetPrivateProfileStringW(L"DriftTable", L"PenColor", L"FFFF4D4D", buf, 64, settingsFile_.c_str());
@@ -316,7 +373,8 @@ void App::loadSettings() {
 void App::saveSettings() {
     const wchar_t* m =
         savedMode_ == HostMode::Overlay ? L"overlay" : savedMode_ == HostMode::Window ? L"window" : L"embed";
-    WritePrivateProfileStringW(L"DriftTable", L"Mode", m, settingsFile_.c_str());
+    WritePrivateProfileStringW(L"DriftTable", L"HostMode", m, settingsFile_.c_str());
+    WritePrivateProfileStringW(L"DriftTable", L"Mode", nullptr, settingsFile_.c_str()); // 0.1 key, now unused
     WritePrivateProfileStringW(L"DriftTable", L"HideDesktopIcons", hideIcons_ ? L"1" : L"0", settingsFile_.c_str());
     wchar_t buf[16];
     swprintf(buf, 16, L"%08X", penColor_);
@@ -375,6 +433,7 @@ void App::addTrayIcon() {
 void App::showTrayMenu() {
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, TRAY_RESET, L"Вернуться к началу\tHome");
+    AppendMenuW(m, MF_STRING | (overview_ ? MF_CHECKED : 0), TRAY_OVERVIEW, L"Обзор (отдалить)\tTab");
     AppendMenuW(m, MF_STRING, TRAY_FIT, L"Показать всё\tF");
     AppendMenuW(m, MF_STRING | (tool_ == Tool::Pen ? MF_CHECKED : 0), TRAY_PEN, L"Рисовать\tB");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
@@ -397,6 +456,7 @@ void App::showTrayMenu() {
     switch (cmd) {
     case TRAY_RESET: resetView(); break;
     case TRAY_FIT: fitAll(); break;
+    case TRAY_OVERVIEW: toggleOverview(); break;
     case TRAY_PEN: setTool(tool_ == Tool::Pen ? Tool::Select : Tool::Pen); break;
     case TRAY_HIDE_ICONS: setIconsHidden(!hideIcons_); break;
     case TRAY_SYSTEM_ICONS: addSystemIcons(); break;
@@ -460,6 +520,17 @@ LRESULT App::onMainMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SETTINGCHANGE:
         updateBounds();
         return 0;
+    // Keyboard focus of the overlay canvas lives here (see focusCanvas).
+    case WM_KEYDOWN: onKeyDown(wp); return 0;
+    case WM_KEYUP: onKeyUp(wp); return 0;
+    case WM_CHAR: onChar((wchar_t)wp); return 0;
+    case WM_KILLFOCUS: spaceDown_ = false; return 0;
+    case WM_MOUSEWHEEL:
+    case WM_MOUSEHWHEEL: {
+        POINT sp{(short)LOWORD(lp), (short)HIWORD(lp)};
+        onWheel(GET_WHEEL_DELTA_WPARAM(wp), msg == WM_MOUSEHWHEEL, screenToClient(sp));
+        return 0;
+    }
     case WM_QUERYENDSESSION: return TRUE;
     case WM_ENDSESSION:
         if (wp) {
@@ -467,7 +538,7 @@ LRESULT App::onMainMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (host_.listView) DesktopHost::setIconsVisible(host_, true);
         }
         return 0;
-    case WM_CLOSE: quit(); return 0;
+    case WM_CLOSE: return 0; // Alt+F4 while the canvas has focus: not a reason to quit
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -480,8 +551,12 @@ LRESULT App::onCanvasMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_LBUTTONDOWN: onMouseDown(0, pt(), false); return 0;
     case WM_LBUTTONDBLCLK: onMouseDown(0, pt(), true); return 0;
-    case WM_MBUTTONDOWN:
-    case WM_MBUTTONDBLCLK: onMouseDown(1, pt(), false); return 0;
+    case WM_MBUTTONDOWN: onMouseDown(1, pt(), false); return 0;
+    case WM_MBUTTONDBLCLK:
+        // Double click with the middle button (without dragging): overview.
+        if (panTravel_ < 6 && drag_ == Drag::None) toggleOverview();
+        else onMouseDown(1, pt(), false);
+        return 0;
     case WM_RBUTTONDOWN:
     case WM_RBUTTONDBLCLK: onMouseDown(2, pt(), false); return 0;
     case WM_LBUTTONUP: onMouseUp(0, pt()); return 0;
@@ -528,10 +603,10 @@ LRESULT App::onCanvasMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
     case WM_MOUSEACTIVATE:
         // The overlay window must not jump above other windows when clicked.
-        if (mode_ == HostMode::Overlay) return editId_ ? MA_ACTIVATE : MA_NOACTIVATE;
+        if (mode_ == HostMode::Overlay) return MA_NOACTIVATE;
         break;
     case WM_WINDOWPOSCHANGING:
-        if (mode_ == HostMode::Overlay) reinterpret_cast<WINDOWPOS*>(lp)->flags |= SWP_NOZORDER;
+        if (mode_ == HostMode::Overlay && !allowZOrder_) reinterpret_cast<WINDOWPOS*>(lp)->flags |= SWP_NOZORDER;
         break;
     case WM_SIZE:
         if (mode_ == HostMode::Window && canvas_) updateBounds();

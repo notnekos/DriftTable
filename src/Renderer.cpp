@@ -97,7 +97,11 @@ bool Renderer::createTarget() {
         D2D1_RENDER_TARGET_TYPE_DEFAULT,
         D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 0, 0,
         D2D1_RENDER_TARGET_USAGE_NONE, D2D1_FEATURE_LEVEL_DEFAULT);
-    if (FAILED(factory_->CreateDCRenderTarget(&props, &target_))) return false;
+    HRESULT hr = factory_->CreateDCRenderTarget(&props, &target_);
+    if (FAILED(hr)) {
+        logf(L"CreateDCRenderTarget failed: 0x%08lX", (unsigned long)hr);
+        return false;
+    }
     target_->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
     target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 1), &brush_);
     ++generation_; // invalidates every cached device bitmap
@@ -108,7 +112,13 @@ ID2D1RenderTarget* Renderer::beginDraw() {
     if (!dib_) return nullptr;
     if (!target_ && !createTarget()) return nullptr;
     RECT rc{0, 0, width_, height_};
-    if (FAILED(target_->BindDC(memDC_, &rc))) return nullptr;
+    HRESULT hr = target_->BindDC(memDC_, &rc);
+    if (FAILED(hr)) {
+        static bool logged = false;
+        if (!logged) logf(L"BindDC failed: 0x%08lX", (unsigned long)hr);
+        logged = true;
+        return nullptr;
+    }
     target_->BeginDraw();
     target_->SetTransform(D2D1::Matrix3x2F::Identity());
     return target_.Get();
@@ -116,6 +126,7 @@ ID2D1RenderTarget* Renderer::beginDraw() {
 
 bool Renderer::endDraw(HWND hwnd, bool layered) {
     HRESULT hr = target_->EndDraw();
+    if (FAILED(hr)) logf(L"EndDraw: 0x%08lX", (unsigned long)hr);
     if (hr == (HRESULT)D2DERR_RECREATE_TARGET) {
         target_.Reset();
         brush_.Reset();
@@ -125,7 +136,13 @@ bool Renderer::endDraw(HWND hwnd, bool layered) {
         SIZE size{width_, height_};
         POINT src{0, 0};
         BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-        UpdateLayeredWindow(hwnd, nullptr, nullptr, &size, memDC_, &src, 0, &blend, ULW_ALPHA);
+        static int reported = 0;
+        if (!UpdateLayeredWindow(hwnd, nullptr, nullptr, &size, memDC_, &src, 0, &blend, ULW_ALPHA)) {
+            if (reported++ < 3) logf(L"UpdateLayeredWindow failed: error %lu", GetLastError());
+        } else if (!reported) {
+            logf(L"first frame shown (%dx%d)", width_, height_);
+            reported = -1000000; // log success once
+        }
     } else {
         HDC dc = GetDC(hwnd);
         BitBlt(dc, 0, 0, width_, height_, memDC_, 0, 0, SRCCOPY);

@@ -18,13 +18,13 @@
 namespace dt {
 
 enum class HostMode {
-    Embed,   // child of the desktop icon host: lives exactly where desktop icons live
-    Overlay, // top-level layered window owned by the desktop, kept at the bottom
+    Overlay, // top-level layered window owned by the desktop, kept just above the wallpaper
+    Embed,   // child of the desktop icon host (does not render on some Windows 11 builds)
     Window,  // ordinary window, for trying things out and debugging
 };
 
 struct Options {
-    HostMode mode = HostMode::Embed;
+    HostMode mode = HostMode::Overlay;
     bool modeForced = false;
 };
 
@@ -56,6 +56,9 @@ private:
     bool createCanvas(bool startup);
     void onCanvasDestroyed();
     void checkHost();
+    void placeAtBottom();
+    void focusCanvas();
+    HWND menuOwner() const;
     void updateBounds();
     void mainLoop();
     void quit();
@@ -104,6 +107,8 @@ private:
     void selectOnly(uint64_t id);
     void fitAll();
     void stopMotion();
+    void toggleOverview();
+    void leaveOverviewAt(Vec2 world);
     void invalidate() { dirty_ = true; }
 
     void onMouseDown(int button, Vec2 p, bool dbl);
@@ -146,8 +151,9 @@ private:
 
     // ---- state ---------------------------------------------------------
     HINSTANCE instance_ = nullptr;
-    HostMode mode_ = HostMode::Embed;
-    HostMode savedMode_ = HostMode::Embed; // from settings.ini; command line overrides don't stick
+    HostMode mode_ = HostMode::Overlay;
+    HostMode savedMode_ = HostMode::Overlay; // from settings.ini; command line overrides don't stick
+    bool allowZOrder_ = false;               // overlay: only we may change our z-order
     HWND main_ = nullptr;
     HWND canvas_ = nullptr;
     DesktopHost host_;
@@ -194,6 +200,12 @@ private:
         double fromX, fromY, fromZoom, toX, toY, toZoom;
     } flight_;
     bool dirty_ = true;
+
+    // Overview: zoomed far out to see the whole canvas; a click flies back in.
+    bool overview_ = false;
+    double ovX_ = 0, ovY_ = 0, ovZoom_ = 1;
+    RectD ovView_; // what was on the main screen before zooming out
+    double panTravel_ = 0;
 
     // Interaction
     enum class Drag { None, Pan, Move, Rubber, Draw, Erase, Resize } drag_ = Drag::None;

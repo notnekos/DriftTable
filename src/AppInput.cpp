@@ -4,7 +4,7 @@ namespace dt {
 
 namespace {
 
-constexpr double kMinZoom = 0.05;
+constexpr double kMinZoom = 0.02;
 constexpr double kMaxZoom = 8.0;
 constexpr double kEraserRadius = 10.0;
 
@@ -34,6 +34,7 @@ enum : UINT {
     CMD_REFRESH,
     CMD_EXIT,
     CMD_PERSONALIZE,
+    CMD_OVERVIEW,
     CMD_DISPLAY,
     CMD_NOTE_COLOR, // + index
 };
@@ -75,6 +76,7 @@ void App::homeCamera(double* x, double* y) const {
 }
 
 void App::resetView(bool animate) {
+    overview_ = false;
     double x, y;
     homeCamera(&x, &y);
     if (animate) {
@@ -88,6 +90,7 @@ void App::resetView(bool animate) {
 }
 
 void App::fitAll() {
+    overview_ = false;
     bool any = false;
     RectD b = board_.contentBounds(&any);
     if (!any) {
@@ -100,6 +103,49 @@ void App::fitAll() {
     double s = z * dpi_;
     double cx = (pa.left + pa.right) / 2.0, cy = (pa.top + pa.bottom) / 2.0;
     flyTo(b.x + b.w / 2 - cx / s, b.y + b.h / 2 - cy / s, z);
+}
+
+void App::toggleOverview() {
+    commitEdit();
+    if (overview_) {
+        overview_ = false;
+        flyTo(ovX_, ovY_, ovZoom_);
+        return;
+    }
+    RECT pa = primaryWorkArea();
+    Vec2 a = toWorld({(double)pa.left, (double)pa.top}), b = toWorld({(double)pa.right, (double)pa.bottom});
+    ovView_ = RectD::fromPoints(a, b);
+    ovX_ = camX_;
+    ovY_ = camY_;
+    ovZoom_ = zoom_;
+    overview_ = true;
+
+    // Everything on the canvas plus the current view, with some air around it.
+    bool any = false;
+    RectD all = board_.contentBounds(&any);
+    if (any) {
+        double x0 = std::min(all.x, ovView_.x), y0 = std::min(all.y, ovView_.y);
+        double x1 = std::max(all.right(), ovView_.right()), y1 = std::max(all.bottom(), ovView_.bottom());
+        all = {x0, y0, x1 - x0, y1 - y0};
+    } else {
+        all = ovView_;
+    }
+    double aw = pa.right - pa.left - 160, ah = pa.bottom - pa.top - 200;
+    double z = std::min(aw / std::max(1.0, all.w), ah / std::max(1.0, all.h)) / dpi_;
+    // Always step back noticeably, even when everything already fits.
+    z = std::clamp(std::min(z, zoom_ * 0.45), kMinZoom, kMaxZoom);
+    double s = z * dpi_;
+    double cx = (pa.left + pa.right) / 2.0, cy = (pa.top + pa.bottom) / 2.0 + 20;
+    flyTo(all.x + all.w / 2 - cx / s, all.y + all.h / 2 - cy / s, z);
+}
+
+// Fly from the overview to a point, back at the zoom we had before.
+void App::leaveOverviewAt(Vec2 world) {
+    overview_ = false;
+    RECT pa = primaryWorkArea();
+    double s = ovZoom_ * dpi_;
+    double cx = (pa.left + pa.right) / 2.0, cy = (pa.top + pa.bottom) / 2.0;
+    flyTo(world.x - cx / s, world.y - cy / s, ovZoom_);
 }
 
 bool App::tick(double dt) {
@@ -223,7 +269,7 @@ HCURSOR App::cursorFor(Vec2 p) const {
 
 void App::onMouseDown(int button, Vec2 p, bool dbl) {
     cursor_ = p;
-    if (GetFocus() != canvas_) SetFocus(canvas_);
+    focusCanvas();
     if (drag_ != Drag::None) return;
 
     auto beginPan = [&](int btn) {
@@ -231,6 +277,7 @@ void App::onMouseDown(int button, Vec2 p, bool dbl) {
         drag_ = Drag::Pan;
         dragButton_ = btn;
         dragLast_ = p;
+        panTravel_ = 0;
         panSamples_.clear();
         panSamples_.push_back({seconds(), p});
         SetCapture(canvas_);
@@ -345,6 +392,7 @@ void App::onMouseMove(Vec2 p) {
     switch (drag_) {
     case Drag::Pan: {
         Vec2 d = p - dragLast_;
+        panTravel_ += d.length();
         camX_ -= d.x / scale();
         camY_ -= d.y / scale();
         dragLast_ = p;
@@ -480,6 +528,9 @@ void App::endDrag(bool cancelled) {
     case Drag::Move:
         if (!dragMoved_) {
             if (!cancelled && !keyDown(VK_CONTROL) && !keyDown(VK_SHIFT)) selectOnly(pressedId_);
+            if (!cancelled && overview_) {
+                if (Item* it = board_.find(pressedId_)) leaveOverviewAt({it->x + it->w / 2, it->y + it->h / 2});
+            }
         } else {
             scheduleSave();
         }
@@ -496,7 +547,11 @@ void App::endDrag(bool cancelled) {
     case Drag::Resize:
         if (dragMoved_) scheduleSave();
         break;
-    case Drag::Rubber: rubber_ = {}; break;
+    case Drag::Rubber:
+        // A plain click on an empty spot in the overview: go there.
+        if (!cancelled && overview_ && (cursor_ - dragStart_).length() < 5) leaveOverviewAt(toWorld(dragStart_));
+        rubber_ = {};
+        break;
     case Drag::None: break;
     }
     invalidate();
@@ -637,9 +692,11 @@ void App::onKeyDown(WPARAM vk) {
         break;
     case VK_DELETE: deleteSelection(); break;
     case VK_ESCAPE:
-        if (tool_ != Tool::Select) setTool(Tool::Select);
+        if (overview_) toggleOverview();
+        else if (tool_ != Tool::Select) setTool(Tool::Select);
         else selectOnly(0);
         break;
+    case VK_TAB: toggleOverview(); break;
     case VK_HOME: resetView(); break;
     case VK_F2:
         if (selected_.size() == 1) {
@@ -808,7 +865,7 @@ void App::showItemMenu(int index, Vec2 p) {
         if (isImageExtension(extensionOf(it.path))) extra.push_back({CMD_PIN, L"Прикрепить как картинку"});
         if (it.isVirtual()) extra.push_back({CMD_REMOVE, L"Убрать с холста"});
         auto paths = selectedFilePaths();
-        UINT cmd = shell::contextMenu(canvas_, paths, sp, extra);
+        UINT cmd = shell::contextMenu(menuOwner(), paths, sp, extra);
         if (cmd) runCommand(cmd, p);
         SetTimer(main_, TIMER_SYNC, 400, nullptr);
         return;
@@ -832,7 +889,7 @@ void App::showItemMenu(int index, Vec2 p) {
     }
     AppendMenuW(m, MF_STRING, CMD_FRONT, L"На передний план");
     AppendMenuW(m, MF_STRING, CMD_DELETE, L"Удалить\tDel");
-    UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, sp.x, sp.y, canvas_, nullptr);
+    UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, sp.x, sp.y, menuOwner(), nullptr);
     DestroyMenu(m);
     if (cmd) runCommand(cmd, p);
 }
@@ -852,6 +909,7 @@ void App::showCanvasMenu(Vec2 p) {
     AppendMenuW(m, check(Tool::Eraser), CMD_TOOL_ERASER, L"Ластик\tE");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, CMD_HOME, L"Вернуться к началу\tHome");
+    AppendMenuW(m, MF_STRING | (overview_ ? MF_CHECKED : 0), CMD_OVERVIEW, L"Обзор (отдалить)\tTab");
     AppendMenuW(m, MF_STRING, CMD_FIT, L"Показать всё\tF");
     AppendMenuW(m, MF_STRING | (board_.canUndo() ? 0 : MF_GRAYED), CMD_UNDO, L"Отменить\tCtrl+Z");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
@@ -863,7 +921,7 @@ void App::showCanvasMenu(Vec2 p) {
     AppendMenuW(m, MF_STRING, CMD_EXIT, L"Выйти из DriftTable");
 
     POINT sp = clientToScreen(p);
-    UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, sp.x, sp.y, canvas_, nullptr);
+    UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, sp.x, sp.y, menuOwner(), nullptr);
     DestroyMenu(m);
     if (cmd) runCommand(cmd, p);
 }
@@ -951,6 +1009,7 @@ void App::runCommand(UINT cmd, Vec2 p) {
     case CMD_TOOL_ERASER: setTool(Tool::Eraser); break;
     case CMD_HOME: resetView(); break;
     case CMD_FIT: fitAll(); break;
+    case CMD_OVERVIEW: toggleOverview(); break;
     case CMD_UNDO:
         if (board_.undo()) {
             syncDesktop();

@@ -126,19 +126,8 @@ bool isBlank(const Image& img) {
     return true;
 }
 
-// Fallback: the icon from the system image list, drawn into a 32-bit DIB.
-std::shared_ptr<Image> systemIcon(const std::wstring& path, int size) {
-    PIDLIST_ABSOLUTE pidl = nullptr;
-    if (FAILED(SHParseDisplayName(path.c_str(), nullptr, &pidl, 0, nullptr))) return nullptr;
-    SHFILEINFOW sfi{};
-    DWORD_PTR ok = SHGetFileInfoW(reinterpret_cast<LPCWSTR>(pidl), 0, &sfi, sizeof(sfi), SHGFI_PIDL | SHGFI_SYSICONINDEX);
-    CoTaskMemFree(pidl);
-    if (!ok) return nullptr;
-    ComPtr<IImageList> list;
-    if (FAILED(SHGetImageList(size > 48 ? SHIL_JUMBO : SHIL_EXTRALARGE, IID_PPV_ARGS(&list)))) return nullptr;
-    HICON icon = nullptr;
-    if (FAILED(list->GetIcon(sfi.iIcon, ILD_TRANSPARENT, &icon)) || !icon) return nullptr;
-
+// Draws an icon into a 32-bit DIB of the given size.
+std::shared_ptr<Image> iconToImage(HICON icon, int size) {
     BITMAPINFO bi{};
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bi.bmiHeader.biWidth = size;
@@ -167,7 +156,64 @@ std::shared_ptr<Image> systemIcon(const std::wstring& path, int size) {
                 if (img->pixels[i] | img->pixels[i + 1] | img->pixels[i + 2]) img->pixels[i + 3] = 255;
     }
     DeleteDC(dc);
+    return img;
+}
+
+// System image list index and overlay number (0 = none) of a shell item.
+bool systemIconIndex(const std::wstring& path, int* index, int* overlay, bool* isLink = nullptr) {
+    PIDLIST_ABSOLUTE pidl = nullptr;
+    if (FAILED(SHParseDisplayName(path.c_str(), nullptr, &pidl, 0, nullptr))) return false;
+    SHFILEINFOW sfi{};
+    // SHGFI_OVERLAYINDEX needs SHGFI_ICON; the overlay comes in the top byte of iIcon.
+    sfi.dwAttributes = SFGAO_LINK; // with SHGFI_ATTR_SPECIFIED: only ask for this one
+    DWORD_PTR ok = SHGetFileInfoW(reinterpret_cast<LPCWSTR>(pidl), 0, &sfi, sizeof(sfi),
+                                  SHGFI_PIDL | SHGFI_SYSICONINDEX | SHGFI_ICON | SHGFI_OVERLAYINDEX |
+                                      SHGFI_ATTRIBUTES | SHGFI_ATTR_SPECIFIED);
+    CoTaskMemFree(pidl);
+    if (sfi.hIcon) DestroyIcon(sfi.hIcon);
+    if (!ok) return false;
+    *index = sfi.iIcon & 0x00FFFFFF;
+    *overlay = (sfi.iIcon >> 24) & 0xFF;
+    if (isLink) *isLink = (sfi.dwAttributes & SFGAO_LINK) != 0;
+    return true;
+}
+
+ComPtr<IImageList> systemImageList(int size) {
+    ComPtr<IImageList> list;
+    SHGetImageList(size > 48 ? SHIL_JUMBO : SHIL_EXTRALARGE, IID_PPV_ARGS(&list));
+    return list;
+}
+
+// Fallback: the icon from the system image list.
+std::shared_ptr<Image> systemIcon(const std::wstring& path, int size) {
+    int index = 0, overlay = 0;
+    if (!systemIconIndex(path, &index, &overlay)) return nullptr;
+    auto list = systemImageList(size);
+    HICON icon = nullptr;
+    if (!list || FAILED(list->GetIcon(index, ILD_TRANSPARENT, &icon)) || !icon) return nullptr;
+    auto img = iconToImage(icon, size);
     DestroyIcon(icon);
+    return img;
+}
+
+// The overlay Explorer draws over this item (the shortcut arrow for .lnk/.url,
+// sync status icons...). Respects a user who removed the shortcut arrow.
+std::shared_ptr<Image> overlayImage(const std::wstring& path, int size) {
+    int index = 0, overlay = 0;
+    bool isLink = false;
+    if (!systemIconIndex(path, &index, &overlay, &isLink)) return nullptr;
+    auto list = systemImageList(size);
+    if (!list) return nullptr;
+    int image = -1;
+    if (overlay > 0) list->GetOverlayImage(overlay, &image);
+    // A shortcut whose overlay was not reported: the standard shortcut arrow.
+    if (image < 0 && isLink) image = SHGetIconOverlayIndexW(nullptr, IDO_SHGIOI_LINK);
+    if (image < 0) return nullptr;
+    HICON icon = nullptr;
+    if (FAILED(list->GetIcon(image, ILD_TRANSPARENT, &icon)) || !icon) return nullptr;
+    auto img = iconToImage(icon, size);
+    DestroyIcon(icon);
+    if (img && isBlank(*img)) img.reset();
     return img;
 }
 
@@ -267,7 +313,10 @@ LoadResult ImageLoader::loadIcon(const Job& job) {
         }
     }
     if (!r.image || isBlank(*r.image)) r.image = systemIcon(job.path, job.size);
-    if (r.image) trimPadding(*r.image);
+    if (r.image) {
+        trimPadding(*r.image);
+        r.image->overlay = overlayImage(job.path, job.size);
+    }
     return r;
 }
 

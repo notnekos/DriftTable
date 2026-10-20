@@ -60,6 +60,8 @@ int App::run(HINSTANCE instance, const Options& options) {
         if (auto fn = (RtlGetVersionFn)(void*)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion")) fn(&v);
         logf(L"DriftTable 0.2, Windows %lu.%lu build %lu", v.dwMajorVersion, v.dwMinorVersion, v.dwBuildNumber);
     }
+    elevated_ = isElevated();
+    if (elevated_) logf(L"running as administrator: drag & drop via WM_DROPFILES");
 
     loadSettings();
     if (options.modeForced) mode_ = options.mode;
@@ -225,7 +227,16 @@ void App::addSurface(HWND hwnd) {
         drops_.push_back({f, pt, effect, keys});
         PostMessageW(main_, WM_APP_DROP, 0, 0);
     };
-    RegisterDragDrop(hwnd, s.drop);
+    if (elevated_) {
+        // Explorer cannot reach an elevated OLE drop target (UIPI), but the old
+        // WM_DROPFILES protocol works once these messages are let through.
+        DragAcceptFiles(hwnd, TRUE);
+        ChangeWindowMessageFilterEx(hwnd, WM_DROPFILES, MSGFLT_ALLOW, nullptr);
+        ChangeWindowMessageFilterEx(hwnd, WM_COPYDATA, MSGFLT_ALLOW, nullptr);
+        ChangeWindowMessageFilterEx(hwnd, 0x0049 /* WM_COPYGLOBALDATA */, MSGFLT_ALLOW, nullptr);
+    } else {
+        RegisterDragDrop(hwnd, s.drop);
+    }
     surfaces_.push_back(s);
     canvas_ = surfaces_[0].hwnd;
     logf(L"canvas window %p", (void*)hwnd);
@@ -702,6 +713,29 @@ LRESULT App::onCanvasMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_KILLFOCUS:
         spaceDown_ = false;
         return 0;
+    case WM_DROPFILES: {
+        auto drop = reinterpret_cast<HDROP>(wp);
+        std::vector<std::wstring> files;
+        UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+        for (UINT i = 0; i < n; ++i) {
+            UINT len = DragQueryFileW(drop, i, nullptr, 0);
+            std::wstring file(len, L'\0');
+            DragQueryFileW(drop, i, file.data(), len + 1);
+            files.push_back(file);
+        }
+        POINT at{};
+        DragQueryPoint(drop, &at);
+        ClientToScreen(hwnd, &at);
+        DragFinish(drop);
+        DWORD keys = (GetKeyState(VK_CONTROL) < 0 ? MK_CONTROL : 0) | (GetKeyState(VK_SHIFT) < 0 ? MK_SHIFT : 0) |
+                     (GetKeyState(VK_MENU) < 0 ? MK_ALT : 0);
+        DWORD effect = dropEffect(files, at, keys, DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK);
+        if (!files.empty() && effect != DROPEFFECT_NONE) {
+            drops_.push_back({files, at, effect, keys});
+            PostMessageW(main_, WM_APP_DROP, 0, 0);
+        }
+        return 0;
+    }
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT) {
             POINT p;

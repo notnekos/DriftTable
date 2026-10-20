@@ -169,6 +169,18 @@ inline void logf(const wchar_t* fmt, ...) {
     CloseHandle(h);
 }
 
+// True when the process runs with administrator rights (UAC elevated).
+inline bool isElevated() {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+    TOKEN_ELEVATION elevation{};
+    DWORD size = 0;
+    bool elevated = GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size) &&
+                    elevation.TokenIsElevated;
+    CloseHandle(token);
+    return elevated;
+}
+
 // Monotonic time in seconds.
 inline double seconds() {
     static const double freq = [] {

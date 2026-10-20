@@ -1,6 +1,9 @@
 #include "ShellOps.h"
 
+#include <exdisp.h>
 #include <shellapi.h>
+#include <shldisp.h>
+#include <shlguid.h>
 #include <shlobj.h>
 
 namespace dt {
@@ -265,6 +268,48 @@ DWORD dragOut(const std::vector<std::wstring>& paths) {
     DWORD effect = DROPEFFECT_NONE;
     SHDoDragDrop(nullptr, data.Get(), nullptr, DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK, &effect);
     return effect;
+}
+
+// The documented way: ask the desktop's own folder view (which runs in Explorer)
+// to ShellExecute the program for us.
+bool launchUnelevated(const std::wstring& exe, const std::wstring& args) {
+    ComPtr<IShellWindows> windows;
+    if (FAILED(CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(&windows))))
+        return false;
+    VARIANT location{}, empty{};
+    location.vt = VT_I4;
+    location.lVal = CSIDL_DESKTOP;
+    empty.vt = VT_EMPTY;
+    long hwnd = 0;
+    ComPtr<IDispatch> dispatch;
+    if (windows->FindWindowSW(&location, &empty, SWC_DESKTOP, &hwnd, SWFO_NEEDDISPATCH, &dispatch) != S_OK ||
+        !dispatch)
+        return false;
+    ComPtr<IServiceProvider> provider;
+    ComPtr<IShellBrowser> browser;
+    ComPtr<IShellView> view;
+    ComPtr<IDispatch> background, app;
+    ComPtr<IShellFolderViewDual> folderView;
+    ComPtr<IShellDispatch2> shell;
+    if (FAILED(dispatch.As(&provider)) ||
+        FAILED(provider->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(&browser))) ||
+        FAILED(browser->QueryActiveShellView(&view)) ||
+        FAILED(view->GetItemObject(SVGIO_BACKGROUND, IID_PPV_ARGS(&background))) ||
+        FAILED(background.As(&folderView)) || FAILED(folderView->get_Application(&app)) || FAILED(app.As(&shell)))
+        return false;
+
+    BSTR file = SysAllocString(exe.c_str());
+    VARIANT vArgs{}, vDir{}, vOp{}, vShow{};
+    vArgs.vt = VT_BSTR;
+    vArgs.bstrVal = SysAllocString(args.c_str());
+    vDir.vt = VT_EMPTY;
+    vOp.vt = VT_EMPTY;
+    vShow.vt = VT_I4;
+    vShow.lVal = SW_SHOWNORMAL;
+    HRESULT hr = shell->ShellExecute(file, vArgs, vDir, vOp, vShow);
+    SysFreeString(file);
+    VariantClear(&vArgs);
+    return SUCCEEDED(hr);
 }
 
 bool copyToClipboard(HWND, const std::vector<std::wstring>& paths) {

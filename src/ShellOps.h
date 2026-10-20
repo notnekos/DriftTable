@@ -56,6 +56,10 @@ bool rename(HWND owner, const std::wstring& path, const std::wstring& newName);
 // Starts an OLE drag of the given files out of the canvas. Returns the effect.
 DWORD dragOut(const std::vector<std::wstring>& paths);
 
+// Starts a program through Explorer, i.e. with Explorer's (normal, not elevated)
+// rights. Used to drop administrator rights we were started with by mistake.
+bool launchUnelevated(const std::wstring& exe, const std::wstring& args);
+
 // Places files on the clipboard (Ctrl+C) so they can be pasted in Explorer.
 bool copyToClipboard(HWND owner, const std::vector<std::wstring>& paths);
 

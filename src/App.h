@@ -184,6 +184,7 @@ private:
     DesktopHost host_;
     bool hideIcons_ = true;
     bool quitting_ = false;
+    bool elevated_ = false; // running as administrator: no OLE drops from Explorer
     POINT origin_{0, 0}; // canvas client (0,0) in screen coordinates
     int width_ = 0, height_ = 0;
     UINT taskbarCreated_ = 0;
